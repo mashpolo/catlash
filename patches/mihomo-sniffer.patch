@@ -1,0 +1,89 @@
+--- a/config/config.go
++++ b/config/config.go
+@@ -1772,7 +1772,7 @@
+ 	return nil
+ }
+ 
+-func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider) (*sniffer.Config, error) {
++func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider, geo ...MobileGeo) (*sniffer.Config, error) {
+ 	snifferConfig := &sniffer.Config{
+ 		Enable:          snifferRaw.Enable,
+ 		ForceDnsMapping: snifferRaw.ForceDnsMapping,
+@@ -1835,25 +1835,25 @@
+ 
+ 	snifferConfig.Sniffers = loadSniffer
+ 
+-	forceDomain, err := parseDomain(snifferRaw.ForceDomain, nil, "sniffer.force-domain", ruleProviders)
++	forceDomain, err := parseDomain(snifferRaw.ForceDomain, nil, "sniffer.force-domain", ruleProviders, geo...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	snifferConfig.ForceDomain = forceDomain
+ 
+-	skipSrcAddress, err := parseIPCIDR(snifferRaw.SkipSrcAddress, nil, "sniffer.skip-src-address", ruleProviders)
++	skipSrcAddress, err := parseIPCIDR(snifferRaw.SkipSrcAddress, nil, "sniffer.skip-src-address", ruleProviders, geo...)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error in skip-src-address, error:%w", err)
+ 	}
+ 	snifferConfig.SkipSrcAddress = skipSrcAddress
+ 
+-	skipDstAddress, err := parseIPCIDR(snifferRaw.SkipDstAddress, nil, "sniffer.skip-dst-address", ruleProviders)
++	skipDstAddress, err := parseIPCIDR(snifferRaw.SkipDstAddress, nil, "sniffer.skip-dst-address", ruleProviders, geo...)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error in skip-dst-address, error:%w", err)
+ 	}
+ 	snifferConfig.SkipDstAddress = skipDstAddress
+ 
+-	skipDomain, err := parseDomain(snifferRaw.SkipDomain, nil, "sniffer.skip-domain", ruleProviders)
++	skipDomain, err := parseDomain(snifferRaw.SkipDomain, nil, "sniffer.skip-domain", ruleProviders, geo...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -1862,7 +1862,7 @@
+ 	return snifferConfig, nil
+ }
+ 
+-func parseIPCIDR(addresses []string, cidrSet *cidr.IpCidrSet, adapterName string, ruleProviders map[string]P.RuleProvider) (matchers []C.IpMatcher, err error) {
++func parseIPCIDR(addresses []string, cidrSet *cidr.IpCidrSet, adapterName string, ruleProviders map[string]P.RuleProvider, geo ...MobileGeo) (matchers []C.IpMatcher, err error) {
+ 	var matcher C.IpMatcher
+ 	for _, ipcidr := range addresses {
+ 		ipcidrLower := strings.ToLower(ipcidr)
+@@ -1871,7 +1871,7 @@
+ 			subkeys = subkeys[1:]
+ 			subkeys = strings.Split(subkeys[0], ",")
+ 			for _, country := range subkeys {
+-				matcher, err = RC.NewGEOIP(country, adapterName, false, false)
++				matcher, err = newDNSGeoIP(country, adapterName, false, false, geo)
+ 				if err != nil {
+ 					return nil, err
+ 				}
+--- /dev/null
++++ b/config/mobile_sniffer.go
+@@ -0,0 +1,27 @@
++package config
++
++import (
++	"github.com/metacubex/mihomo/component/sniffer"
++	P "github.com/metacubex/mihomo/constant/provider"
++	RP "github.com/metacubex/mihomo/rules/provider"
++)
++
++func ParseMobileSniffer(raw RawSniffer, providers map[string]P.RuleProvider, geo MobileGeo) (*sniffer.Config, error) {
++	parsed, err := parseSniffer(raw, providers, geo)
++	if err != nil {
++		return nil, err
++	}
++	for _, matcher := range parsed.ForceDomain {
++		RP.BindMobileRuleSet(matcher, providers)
++	}
++	for _, matcher := range parsed.SkipDomain {
++		RP.BindMobileRuleSet(matcher, providers)
++	}
++	for _, matcher := range parsed.SkipSrcAddress {
++		RP.BindMobileRuleSet(matcher, providers)
++	}
++	for _, matcher := range parsed.SkipDstAddress {
++		RP.BindMobileRuleSet(matcher, providers)
++	}
++	return parsed, nil
++}

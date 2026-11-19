@@ -1,0 +1,718 @@
+--- a/adapter/outbound/tuic.go
++++ b/adapter/outbound/tuic.go
+@@ -6,6 +6,7 @@
+ 	"math"
+ 	"net"
+ 	"strconv"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/component/ca"
+@@ -22,6 +23,7 @@
+ )
+ 
+ type Tuic struct {
++	socketWorkers sync.WaitGroup
+ 	*Base
+ 	option *TuicOption
+ 	client *tuic.PoolClient
+@@ -111,10 +113,13 @@
+ }
+ 
+ func (t *Tuic) dial(ctx context.Context) (quicConn *quic.Conn, err error) {
+-	_, quicConn, err = common.DialQuic(ctx, t.addr, t.DialOptions(), t.dialer, t.tlsConfig, t.quicConfig, common.DialQuicOption{Early: t.option.ReduceRtt})
+-	if err != nil {
+-		return nil, err
+-	}
++	var packetConn net.PacketConn
++	packetConn, quicConn, err = common.DialQuic(ctx, t.addr, t.DialOptions(), t.dialer, t.tlsConfig, t.quicConfig, common.DialQuicOption{Early: t.option.ReduceRtt})
++	if err != nil {
++		return nil, err
++	}
++	t.socketWorkers.Add(1)
++	go func() { defer t.socketWorkers.Done(); <-quicConn.Context().Done(); _ = packetConn.Close() }()
+ 	common.SetCongestionController(quicConn, t.option.CongestionController, t.option.CWND, t.option.BBRProfile)
+ 	return quicConn, nil
+ }
+@@ -298,3 +303,9 @@
+ 
+ 	return t, nil
+ }
++
++func (t *Tuic) Close() error {
++	err := t.client.Close()
++	t.socketWorkers.Wait()
++	return err
++}
+--- /dev/null
++++ b/transport/tuic/mobile_pool_test.go
+@@ -0,0 +1,57 @@
++package tuic
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++	"github.com/metacubex/quic-go"
++)
++
++func TestMobilePoolCloseCancelsPendingDialAndRejectsReuse(t *testing.T) {
++	for _, version := range []int{4, 5} {
++		started := make(chan struct{})
++		var attempts atomic.Int32
++		dial := func(ctx context.Context) (*quic.Conn, error) {
++			attempts.Add(1)
++			close(started)
++			<-ctx.Done()
++			return nil, ctx.Err()
++		}
++		var pool *PoolClient
++		if version == 4 {
++			pool = NewPoolClientV4(&ClientOptionV4{}, dial)
++		} else {
++			pool = NewPoolClientV5(&ClientOptionV5{}, dial)
++		}
++		finished := make(chan error, 1)
++		go func() { _, err := pool.DialContext(context.Background(), &C.Metadata{}); finished <- err }()
++		<-started
++		closed := make(chan error, 1)
++		go func() { closed <- pool.Close() }()
++		select {
++		case err := <-closed:
++			if err != nil {
++				t.Fatal(err)
++			}
++		case <-time.After(time.Second):
++			t.Fatal("pool close did not cancel dial")
++		}
++		if err := <-finished; !errors.Is(err, context.Canceled) {
++			t.Fatalf("dial result: %v", err)
++		}
++		if _, err := pool.DialContext(context.Background(), &C.Metadata{}); !errors.Is(err, net.ErrClosed) {
++			t.Fatalf("closed pool redial: %v", err)
++		}
++		if _, err := pool.ListenPacket(context.Background(), &C.Metadata{}); !errors.Is(err, net.ErrClosed) {
++			t.Fatalf("closed pool UDP: %v", err)
++		}
++		if attempts.Load() != 1 || pool.tcpClients.Len() != 0 || pool.udpClients.Len() != 0 {
++			t.Fatal("closed pool retained clients or redialed")
++		}
++	}
++}
+--- a/transport/tuic/pool_client.go
++++ b/transport/tuic/pool_client.go
+@@ -14,6 +14,12 @@
+ )
+ 
+ type PoolClient struct {
++	stateMu           sync.Mutex
++	closed            bool
++	closeOnce         sync.Once
++	operations        sync.WaitGroup
++	ctx               context.Context
++	cancel            context.CancelFunc
+ 	newClientOptionV4 *ClientOptionV4
+ 	newClientOptionV5 *ClientOptionV5
+ 
+@@ -25,6 +31,11 @@
+ }
+ 
+ func (t *PoolClient) DialContext(ctx context.Context, metadata *C.Metadata) (net.Conn, error) {
++	ctx, done, err := t.begin(ctx)
++	if err != nil {
++		return nil, err
++	}
++	defer done()
+ 	conn, err := t.getClient(false).DialContext(ctx, metadata)
+ 	if errors.Is(err, TooManyOpenStreams) {
+ 		conn, err = t.newClient(false).DialContext(ctx, metadata)
+@@ -36,6 +47,11 @@
+ }
+ 
+ func (t *PoolClient) ListenPacket(ctx context.Context, metadata *C.Metadata) (net.PacketConn, error) {
++	ctx, done, err := t.begin(ctx)
++	if err != nil {
++		return nil, err
++	}
++	defer done()
+ 	pc, err := t.getClient(true).ListenPacket(ctx, metadata)
+ 	if errors.Is(err, TooManyOpenStreams) {
+ 		pc, err = t.newClient(true).ListenPacket(ctx, metadata)
+@@ -101,7 +117,7 @@
+ 		for it := clients.Front(); it != nil; {
+ 			client := it.Value
+ 			if client != bestClient && client.OpenStreams() == 0 && time.Now().Sub(client.LastVisited()) > 30*time.Minute {
+-				client.Close()
++				client.Shutdown()
+ 				next := it.Next()
+ 				clients.Remove(it)
+ 				it = next
+@@ -120,19 +136,54 @@
+ }
+ 
+ func NewPoolClientV4(clientOption *ClientOptionV4, dialFn DialFunc) *PoolClient {
+-	p := &PoolClient{
+-		dialFn: dialFn,
+-	}
++	ctx, cancel := context.WithCancel(context.Background())
++	p := &PoolClient{dialFn: dialFn, ctx: ctx, cancel: cancel}
+ 	newClientOption := *clientOption
+ 	p.newClientOptionV4 = &newClientOption
+ 	return p
+ }
+ 
+ func NewPoolClientV5(clientOption *ClientOptionV5, dialFn DialFunc) *PoolClient {
+-	p := &PoolClient{
+-		dialFn: dialFn,
+-	}
++	ctx, cancel := context.WithCancel(context.Background())
++	p := &PoolClient{dialFn: dialFn, ctx: ctx, cancel: cancel}
+ 	newClientOption := *clientOption
+ 	p.newClientOptionV5 = &newClientOption
+ 	return p
+ }
++
++func (t *PoolClient) begin(ctx context.Context) (context.Context, func(), error) {
++	t.stateMu.Lock()
++	defer t.stateMu.Unlock()
++	if t.closed {
++		return nil, nil, net.ErrClosed
++	}
++	t.operations.Add(1)
++	child, cancel := context.WithCancel(ctx)
++	cancelled := make(chan struct{})
++	stop := context.AfterFunc(t.ctx, func() { cancel(); close(cancelled) })
++	return child, func() {
++		if !stop() {
++			<-cancelled
++		}
++		cancel()
++		t.operations.Done()
++	}, nil
++}
++
++func (t *PoolClient) Close() error {
++	t.closeOnce.Do(func() {
++		t.stateMu.Lock()
++		t.closed = true
++		t.cancel()
++		t.stateMu.Unlock()
++		t.operations.Wait()
++		for _, clients := range []*list.List[Client]{&t.tcpClients, &t.udpClients} {
++			for item := clients.Front(); item != nil; item = clients.Front() {
++				client := item.Value
++				clients.Remove(item)
++				client.Shutdown()
++			}
++		}
++	})
++	return nil
++}
+--- /dev/null
++++ b/transport/tuic/types/mobile_tasks.go
+@@ -0,0 +1,62 @@
++package types
++
++import (
++	"sync"
++	"time"
++)
++
++type ClientTasks struct {
++	mu      sync.Mutex
++	closed  bool
++	workers sync.WaitGroup
++	timers  map[*time.Timer]struct{}
++}
++
++func (t *ClientTasks) Go(run func()) bool {
++	t.mu.Lock()
++	if t.closed {
++		t.mu.Unlock()
++		return false
++	}
++	t.workers.Add(1)
++	t.mu.Unlock()
++	go func() { defer t.workers.Done(); run() }()
++	return true
++}
++
++func (t *ClientTasks) GoError(run func() error) bool { return t.Go(func() { _ = run() }) }
++
++func (t *ClientTasks) AfterFunc(delay time.Duration, run func()) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.closed {
++		return
++	}
++	if t.timers == nil {
++		t.timers = make(map[*time.Timer]struct{})
++	}
++	t.workers.Add(1)
++	var timer *time.Timer
++	timer = time.AfterFunc(delay, func() {
++		defer t.workers.Done()
++		t.mu.Lock()
++		delete(t.timers, timer)
++		t.mu.Unlock()
++		run()
++	})
++	t.timers[timer] = struct{}{}
++}
++
++func (t *ClientTasks) Stop() {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.closed = true
++	for timer := range t.timers {
++		if timer.Stop() {
++			delete(t.timers, timer)
++			t.workers.Done()
++		}
++	}
++}
++
++func (t *ClientTasks) Wait() { t.workers.Wait() }
+--- /dev/null
++++ b/transport/tuic/types/mobile_tasks_test.go
+@@ -0,0 +1,43 @@
++package types
++
++import (
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestClientTasksStopJoinsWorkersAndCancelsRetirement(t *testing.T) {
++	var tasks ClientTasks
++	entered, release := make(chan struct{}), make(chan struct{})
++	tasks.Go(func() { close(entered); <-release })
++	<-entered
++	var retired atomic.Bool
++	tasks.AfterFunc(time.Hour, func() { retired.Store(true) })
++	tasks.Stop()
++	tasks.Stop()
++	if tasks.Go(func() { t.Error("task started after stop") }) {
++		t.Fatal("stop accepted new task")
++	}
++	joined := make(chan struct{})
++	go func() { tasks.Wait(); close(joined) }()
++	select {
++	case <-joined:
++		t.Fatal("wait returned while worker active")
++	case <-time.After(10 * time.Millisecond):
++	}
++	close(release)
++	select {
++	case <-joined:
++	case <-time.After(time.Second):
++		t.Fatal("stopped retirement timer retained ownership")
++	}
++	if retired.Load() {
++		t.Fatal("retirement timer ran after cancellation")
++	}
++	tasks.mu.Lock()
++	count := len(tasks.timers)
++	tasks.mu.Unlock()
++	if count != 0 {
++		t.Fatal("retained stopped timers")
++	}
++}
+--- a/transport/tuic/types/type.go
++++ b/transport/tuic/types/type.go
+@@ -27,6 +27,7 @@
+ 	LastVisited() time.Time
+ 	SetLastVisited(last time.Time)
+ 	Close()
++	Shutdown()
+ }
+ 
+ type ServerHandler interface {
+--- a/transport/tuic/v4/client.go
++++ b/transport/tuic/v4/client.go
+@@ -33,6 +33,8 @@
+ }
+ 
+ type clientImpl struct {
++	tasks        types.ClientTasks
++	shutdownOnce sync.Once
+ 	*ClientOption
+ 	dialFn types.DialFunc
+ 	udp    bool
+@@ -64,6 +66,9 @@
+ func (t *clientImpl) getQuicConn(ctx context.Context) (*quic.Conn, error) {
+ 	t.connMutex.Lock()
+ 	defer t.connMutex.Unlock()
++	if t.closed.Load() {
++		return nil, types.ClientClosed
++	}
+ 	if t.quicConn != nil {
+ 		return t.quicConn, nil
+ 	}
+@@ -72,19 +77,19 @@
+ 		return nil, err
+ 	}
+ 
+-	go func() {
++	t.tasks.Go(func() {
+ 		_ = t.sendAuthentication(quicConn)
+-	}()
++	})
+ 
+ 	if t.udp {
+-		go func() {
++		t.tasks.Go(func() {
+ 			switch t.UdpRelayMode {
+ 			case types.QUIC:
+ 				_ = t.handleUniStream(quicConn)
+ 			default: // native
+ 				_ = t.handleMessage(quicConn)
+ 			}
+-		}()
++		})
+ 	}
+ 
+ 	t.quicConn = quicConn
+@@ -127,7 +132,7 @@
+ 		if err != nil {
+ 			return err
+ 		}
+-		go func() (err error) {
++		t.tasks.GoError(func() (err error) {
+ 			var assocId uint32
+ 			defer func() {
+ 				t.deferQuicConn(quicConn, err)
+@@ -164,7 +169,7 @@
+ 				}
+ 			}
+ 			return
+-		}()
++		})
+ 	}
+ }
+ 
+@@ -178,7 +183,7 @@
+ 		if err != nil {
+ 			return err
+ 		}
+-		go func() (err error) {
++		t.tasks.GoError(func() (err error) {
+ 			var assocId uint32
+ 			defer func() {
+ 				t.deferQuicConn(quicConn, err)
+@@ -212,7 +217,7 @@
+ 				}
+ 			}
+ 			return
+-		}()
++		})
+ 	}
+ }
+ 
+@@ -288,7 +293,7 @@
+ 			quicConn.LocalAddr(),
+ 			quicConn.RemoteAddr(),
+ 			func() {
+-				time.AfterFunc(C.DefaultTCPTimeout, func() {
++				t.tasks.AfterFunc(C.DefaultTCPTimeout, func() {
+ 					openStreams := t.openStreams.Add(-1)
+ 					if openStreams == 0 && t.closed.Load() {
+ 						t.forceClose(quicConn, types.ClientClosed)
+@@ -363,7 +368,7 @@
+ 		deferQuicConnFn:       t.deferQuicConn,
+ 		closeDeferFn: func() {
+ 			t.udpInputMap.Delete(connId)
+-			time.AfterFunc(C.DefaultUDPTimeout, func() {
++			t.tasks.AfterFunc(C.DefaultUDPTimeout, func() {
+ 				openStreams := t.openStreams.Add(-1)
+ 				if openStreams == 0 && t.closed.Load() {
+ 					t.forceClose(quicConn, types.ClientClosed)
+@@ -412,5 +417,15 @@
+ 
+ func closeClient(client *Client) {
+ 	log.Debugln("Close TuicV4 Client at %p", client)
+-	client.forceClose()
+-}
++	client.Shutdown()
++}
++
++func (t *Client) Shutdown() {
++	runtime.SetFinalizer(t, nil)
++	t.clientImpl.shutdownOnce.Do(func() {
++		t.closed.Store(true)
++		t.tasks.Stop()
++		t.clientImpl.forceClose(nil, types.ClientClosed)
++		t.tasks.Wait()
++	})
++}
+--- /dev/null
++++ b/transport/tuic/v4/mobile_packet_test.go
+@@ -0,0 +1,26 @@
++package v4
++
++import (
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/metacubex/mihomo/common/atomic"
++)
++
++func TestMobileConcurrentPacketCloseAndWrite(t *testing.T) {
++	for i := 0; i < 100; i++ {
++		stopped := atomic.NewBool(true)
++		conn := &quicStreamPacketConn{writeClosed: &stopped}
++		start := make(chan struct{})
++		var workers sync.WaitGroup
++		workers.Add(2)
++		go func() { defer workers.Done(); <-start; _ = conn.Close() }()
++		go func() { defer workers.Done(); <-start; _, _ = conn.WriteTo([]byte("packet"), &net.UDPAddr{Port: 53}) }()
++		close(start)
++		workers.Wait()
++		if _, err := conn.WriteTo([]byte("packet"), &net.UDPAddr{Port: 53}); err != net.ErrClosed {
++			t.Fatalf("write after close: %v", err)
++		}
++	}
++}
+--- a/transport/tuic/v4/packet.go
++++ b/transport/tuic/v4/packet.go
+@@ -27,12 +27,12 @@
+ 
+ 	closeOnce sync.Once
+ 	closeErr  error
+-	closed    bool
++	closed    atomic.Bool
+ }
+ 
+ func (q *quicStreamPacketConn) Close() error {
+ 	q.closeOnce.Do(func() {
+-		q.closed = true
++		q.closed.Store(true)
+ 		q.closeErr = q.close()
+ 	})
+ 	return q.closeErr
+@@ -49,7 +49,6 @@
+ 	}
+ 	if q.inputConn != nil {
+ 		_ = q.inputConn.Close()
+-		q.inputConn = nil
+ 
+ 		buf := pool.GetBuffer()
+ 		defer pool.PutBuffer(buf)
+@@ -125,7 +124,7 @@
+ 	if q.udpRelayMode != types.QUIC && len(p) > q.maxUdpRelayPacketSize {
+ 		return 0, &quic.DatagramTooLargeError{MaxDatagramPayloadSize: int64(q.maxUdpRelayPacketSize)}
+ 	}
+-	if q.closed {
++	if q.closed.Load() {
+ 		return 0, net.ErrClosed
+ 	}
+ 	if q.writeClosed != nil && q.writeClosed.Load() {
+--- a/transport/tuic/v5/client.go
++++ b/transport/tuic/v5/client.go
+@@ -32,6 +32,8 @@
+ }
+ 
+ type clientImpl struct {
++	tasks        types.ClientTasks
++	shutdownOnce sync.Once
+ 	*ClientOption
+ 	dialFn types.DialFunc
+ 	udp    bool
+@@ -63,6 +65,9 @@
+ func (t *clientImpl) getQuicConn(ctx context.Context) (*quic.Conn, error) {
+ 	t.connMutex.Lock()
+ 	defer t.connMutex.Unlock()
++	if t.closed.Load() {
++		return nil, types.ClientClosed
++	}
+ 	if t.quicConn != nil {
+ 		return t.quicConn, nil
+ 	}
+@@ -71,18 +76,18 @@
+ 		return nil, err
+ 	}
+ 
+-	go func() {
++	t.tasks.Go(func() {
+ 		_ = t.sendAuthentication(quicConn)
+-	}()
++	})
+ 
+ 	if t.udp && t.UdpRelayMode == types.QUIC {
+-		go func() {
++		t.tasks.Go(func() {
+ 			_ = t.handleUniStream(quicConn)
+-		}()
+-	}
+-	go func() {
++		})
++	}
++	t.tasks.Go(func() {
+ 		_ = t.handleMessage(quicConn) // always handleMessage because tuicV5 using datagram to send the Heartbeat
+-	}()
++	})
+ 
+ 	t.quicConn = quicConn
+ 	t.openStreams.Store(0)
+@@ -128,7 +133,7 @@
+ 		if err != nil {
+ 			return err
+ 		}
+-		go func() (err error) {
++		t.tasks.GoError(func() (err error) {
+ 			var assocId uint16
+ 			defer func() {
+ 				t.deferQuicConn(quicConn, err)
+@@ -165,7 +170,7 @@
+ 				}
+ 			}
+ 			return
+-		}()
++		})
+ 	}
+ }
+ 
+@@ -179,7 +184,7 @@
+ 		if err != nil {
+ 			return err
+ 		}
+-		go func() (err error) {
++		t.tasks.GoError(func() (err error) {
+ 			var assocId uint16
+ 			defer func() {
+ 				t.deferQuicConn(quicConn, err)
+@@ -220,7 +225,7 @@
+ 				heartbeat.BytesLen()
+ 			}
+ 			return
+-		}()
++		})
+ 	}
+ }
+ 
+@@ -296,7 +301,7 @@
+ 			quicConn.LocalAddr(),
+ 			quicConn.RemoteAddr(),
+ 			func() {
+-				time.AfterFunc(C.DefaultTCPTimeout, func() {
++				t.tasks.AfterFunc(C.DefaultTCPTimeout, func() {
+ 					openStreams := t.openStreams.Add(-1)
+ 					if openStreams == 0 && t.closed.Load() {
+ 						t.forceClose(quicConn, types.ClientClosed)
+@@ -347,7 +352,7 @@
+ 		deferQuicConnFn:       t.deferQuicConn,
+ 		closeDeferFn: func() {
+ 			t.udpInputMap.Delete(connId)
+-			time.AfterFunc(C.DefaultUDPTimeout, func() {
++			t.tasks.AfterFunc(C.DefaultUDPTimeout, func() {
+ 				openStreams := t.openStreams.Add(-1)
+ 				if openStreams == 0 && t.closed.Load() {
+ 					t.forceClose(quicConn, types.ClientClosed)
+@@ -396,5 +401,15 @@
+ 
+ func closeClient(client *Client) {
+ 	log.Debugln("Close TuicV5 Client at %p", client)
+-	client.forceClose()
+-}
++	client.Shutdown()
++}
++
++func (t *Client) Shutdown() {
++	runtime.SetFinalizer(t, nil)
++	t.clientImpl.shutdownOnce.Do(func() {
++		t.closed.Store(true)
++		t.tasks.Stop()
++		t.clientImpl.forceClose(nil, types.ClientClosed)
++		t.tasks.Wait()
++	})
++}
+--- /dev/null
++++ b/transport/tuic/v5/mobile_packet_test.go
+@@ -0,0 +1,26 @@
++package v5
++
++import (
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/metacubex/mihomo/common/atomic"
++)
++
++func TestMobileConcurrentPacketCloseAndWrite(t *testing.T) {
++	for i := 0; i < 100; i++ {
++		stopped := atomic.NewBool(true)
++		conn := &quicStreamPacketConn{writeClosed: &stopped}
++		start := make(chan struct{})
++		var workers sync.WaitGroup
++		workers.Add(2)
++		go func() { defer workers.Done(); <-start; _ = conn.Close() }()
++		go func() { defer workers.Done(); <-start; _, _ = conn.WriteTo([]byte("packet"), &net.UDPAddr{Port: 53}) }()
++		close(start)
++		workers.Wait()
++		if _, err := conn.WriteTo([]byte("packet"), &net.UDPAddr{Port: 53}); err != net.ErrClosed {
++			t.Fatalf("write after close: %v", err)
++		}
++	}
++}
+--- a/transport/tuic/v5/packet.go
++++ b/transport/tuic/v5/packet.go
+@@ -29,14 +29,14 @@
+ 
+ 	closeOnce sync.Once
+ 	closeErr  error
+-	closed    bool
++	closed    atomic.Bool
+ 
+ 	deFragger
+ }
+ 
+ func (q *quicStreamPacketConn) Close() error {
+ 	q.closeOnce.Do(func() {
+-		q.closed = true
++		q.closed.Store(true)
+ 		q.closeErr = q.close()
+ 	})
+ 	return q.closeErr
+@@ -53,7 +53,6 @@
+ 	}
+ 	if q.inputConn != nil {
+ 		_ = q.inputConn.Close()
+-		q.inputConn = nil
+ 
+ 		buf := pool.GetBuffer()
+ 		defer pool.PutBuffer(buf)
+@@ -96,7 +95,7 @@
+ }
+ 
+ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+-	if inputConn := q.inputConn; inputConn != nil { // copy inputConn avoid be nil in for loop
++	if inputConn := q.inputConn; inputConn != nil {
+ 		for {
+ 			var packet Packet
+ 			packet, err = ReadPacket(inputConn)
+@@ -116,7 +115,7 @@
+ }
+ 
+ func (q *quicStreamPacketConn) WaitReadFrom() (data []byte, put func(), addr net.Addr, err error) {
+-	if inputConn := q.inputConn; inputConn != nil { // copy inputConn avoid be nil in for loop
++	if inputConn := q.inputConn; inputConn != nil {
+ 		for {
+ 			var packet Packet
+ 			packet, err = ReadPacket(inputConn)
+@@ -139,7 +138,7 @@
+ 	if len(p) > 0xffff { // uint16 max
+ 		return 0, &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 0xffff}
+ 	}
+-	if q.closed {
++	if q.closed.Load() {
+ 		return 0, net.ErrClosed
+ 	}
+ 	if q.writeClosed != nil && q.writeClosed.Load() {

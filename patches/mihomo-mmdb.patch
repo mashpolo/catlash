@@ -1,0 +1,317 @@
+--- /dev/null
++++ b/component/mmdb/mobile.go
+@@ -0,0 +1,288 @@
++package mmdb
++
++import (
++	"bytes"
++	"errors"
++	"strconv"
++	"strings"
++
++	"github.com/oschwald/maxminddb-golang"
++)
++
++var errMobileMMDB = errors.New("invalid or unsupported mobile MMDB resource")
++
++func NewMobileIPReader(data []byte) (*IPReader, error) {
++	reader, err := openMobileMMDB(data)
++	if err != nil {
++		return nil, err
++	}
++	result := &IPReader{Reader: reader}
++	switch reader.Metadata.DatabaseType {
++	case "GeoLite2-Country", "GeoLite2-City", "GeoIP2-Country", "GeoIP2-City", "DBIP-Country-Lite", "DBIP-City-Lite":
++		result.databaseType = typeMaxmind
++	case "sing-geoip":
++		result.databaseType = typeSing
++	case "Meta-geoip0":
++		result.databaseType = typeMetaV0
++	default:
++		reader.Close()
++		return nil, errMobileMMDB
++	}
++	if err = validateMobileRecords(reader, func(networks *maxminddb.Networks) error {
++		switch result.databaseType {
++		case typeMaxmind:
++			var record geoip2Country
++			_, err := networks.Network(&record)
++			return err
++		case typeSing:
++			var record string
++			_, err := networks.Network(&record)
++			return err
++		default:
++			var record any
++			if _, err := networks.Network(&record); err != nil {
++				return err
++			}
++			switch value := record.(type) {
++			case string:
++				return nil
++			case []any:
++				for _, item := range value {
++					if _, ok := item.(string); !ok {
++						return errMobileMMDB
++					}
++				}
++				return nil
++			default:
++				return errMobileMMDB
++			}
++		}
++	}); err != nil {
++		reader.Close()
++		return nil, errMobileMMDB
++	}
++	return result, nil
++}
++
++func NewMobileASNReader(data []byte) (*ASNReader, error) {
++	reader, err := openMobileMMDB(data)
++	if err != nil {
++		return nil, err
++	}
++	switch reader.Metadata.DatabaseType {
++	case "GeoLite2-ASN", "DBIP-ASN-Lite (compat=GeoLite2-ASN)", "ipinfo generic_asn_free.mmdb":
++	default:
++		reader.Close()
++		return nil, errMobileMMDB
++	}
++	if err = validateMobileRecords(reader, func(networks *maxminddb.Networks) error {
++		if reader.Metadata.DatabaseType == "ipinfo generic_asn_free.mmdb" {
++			var record IPInfo
++			if _, err := networks.Network(&record); err != nil {
++				return err
++			}
++			if !strings.HasPrefix(record.ASN, "AS") {
++				return errMobileMMDB
++			}
++			_, err := strconv.ParseUint(strings.TrimPrefix(record.ASN, "AS"), 10, 32)
++			return err
++		}
++		var record GeoLite2
++		_, err := networks.Network(&record)
++		return err
++	}); err != nil {
++		reader.Close()
++		return nil, errMobileMMDB
++	}
++	return &ASNReader{Reader: reader}, nil
++}
++
++func openMobileMMDB(data []byte) (reader *maxminddb.Reader, err error) {
++	defer func() {
++		if recover() != nil {
++			if reader != nil {
++				reader.Close()
++			}
++			reader = nil
++			err = errMobileMMDB
++		}
++	}()
++	if len(data) > 16<<20 {
++		return nil, errMobileMMDB
++	}
++	marker := bytes.LastIndex(data, []byte("\xab\xcd\xefMaxMind.com"))
++	if marker < 0 {
++		return nil, errMobileMMDB
++	}
++	metadata := data[marker+14:]
++	if len(metadata) > 64<<10 {
++		return nil, errMobileMMDB
++	}
++	budget := 64 << 10
++	end, err := validateMobileMMDBValue(metadata, 0, 0, &budget)
++	if err != nil || end != len(metadata) {
++		return nil, errMobileMMDB
++	}
++	reader, err = maxminddb.FromBytes(bytes.Clone(data))
++	if err != nil {
++		return nil, errMobileMMDB
++	}
++	if reader.Metadata.NodeCount > 2_000_000 {
++		reader.Close()
++		return nil, errMobileMMDB
++	}
++	start := reader.Metadata.NodeCount*reader.Metadata.RecordSize/4 + 16
++	if start > uint(marker) {
++		reader.Close()
++		return nil, errMobileMMDB
++	}
++	section := data[start:marker]
++	remaining := 128 << 20
++	for offset := 0; offset < len(section); {
++		limit := 1 << 20
++		if remaining < limit {
++			limit = remaining
++		}
++		budget = limit
++		next, err := validateMobileMMDBValue(section, offset, 0, &budget)
++		remaining -= limit - budget
++		if err != nil || next <= offset {
++			reader.Close()
++			return nil, errMobileMMDB
++		}
++		offset = next
++	}
++	return reader, nil
++}
++
++func validateMobileRecords(reader *maxminddb.Reader, validate func(*maxminddb.Networks) error) error {
++	rows := reader.Networks()
++	for rows.Next() {
++		if err := validate(rows); err != nil {
++			return err
++		}
++	}
++	if err := rows.Err(); err != nil {
++		return err
++	}
++	// Verify rejects valid databases whose records share nested value offsets.
++	return nil
++}
++
++// Bound declared collections and pointer expansion before the reflection decoder allocates them.
++func validateMobileMMDBValue(data []byte, offset, depth int, budget *int) (int, error) {
++	*budget--
++	if depth > 32 || *budget < 0 || offset < 0 || offset >= len(data) {
++		return 0, errMobileMMDB
++	}
++	control := data[offset]
++	offset++
++	kind, size := int(control>>5), int(control&31)
++	if kind == 0 {
++		if offset >= len(data) {
++			return 0, errMobileMMDB
++		}
++		kind = int(data[offset]) + 7
++		offset++
++	}
++	if kind == 1 {
++		width := ((size >> 3) & 3) + 1
++		if width > len(data)-offset {
++			return 0, errMobileMMDB
++		}
++		pointer := size & 7
++		if width == 4 {
++			pointer = 0
++		}
++		for _, b := range data[offset : offset+width] {
++			pointer = pointer<<8 | int(b)
++		}
++		if width == 2 {
++			pointer += 2048
++		}
++		if width == 3 {
++			pointer += 526336
++		}
++		_, err := validateMobileMMDBValue(data, pointer, depth+1, budget)
++		return offset + width, err
++	}
++	if size >= 29 {
++		width := size - 28
++		if width > len(data)-offset {
++			return 0, errMobileMMDB
++		}
++		value := 0
++		for _, b := range data[offset : offset+width] {
++			value = value<<8 | int(b)
++		}
++		size = []int{29, 285, 65821}[width-1] + value
++		offset += width
++	}
++	if kind == 7 || kind == 11 {
++		if size > 256 {
++			return 0, errMobileMMDB
++		}
++		*budget -= size * 64
++		if *budget < 0 {
++			return 0, errMobileMMDB
++		}
++		if kind == 7 {
++			size *= 2
++		}
++		for index := 0; index < size; index++ {
++			var err error
++			offset, err = validateMobileMMDBValue(data, offset, depth+1, budget)
++			if err != nil {
++				return 0, err
++			}
++		}
++		return offset, nil
++	}
++	if kind == 14 {
++		if size > 1 {
++			return 0, errMobileMMDB
++		}
++		return offset, nil
++	}
++	*budget -= size
++	if *budget < 0 || size > 64<<10 || size > len(data)-offset {
++		return 0, errMobileMMDB
++	}
++	return offset + size, nil
++}
++
++// NewMobileIPReaderFromFile opens the immutable database shipped in the app bundle.
++func NewMobileIPReaderFromFile(path string) (*IPReader, error) {
++	reader, err := maxminddb.Open(path)
++	if err != nil {
++		return nil, errMobileMMDB
++	}
++	result := &IPReader{Reader: reader}
++	switch reader.Metadata.DatabaseType {
++	case "GeoLite2-Country", "GeoLite2-City", "GeoIP2-Country", "GeoIP2-City", "DBIP-Country-Lite", "DBIP-City-Lite":
++		result.databaseType = typeMaxmind
++	case "sing-geoip":
++		result.databaseType = typeSing
++	case "Meta-geoip0":
++		result.databaseType = typeMetaV0
++	default:
++		reader.Close()
++		return nil, errMobileMMDB
++	}
++	return result, nil
++}
++
++// NewMobileASNReaderFromFile opens the immutable ASN database in the app bundle.
++func NewMobileASNReaderFromFile(path string) (*ASNReader, error) {
++	reader, err := maxminddb.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	switch reader.Metadata.DatabaseType {
++	case "GeoLite2-ASN", "DBIP-ASN-Lite (compat=GeoLite2-ASN)", "ipinfo generic_asn_free.mmdb":
++		return &ASNReader{Reader: reader}, nil
++	default:
++		reader.Close()
++		return nil, errMobileMMDB
++	}
++}
+--- a/component/mmdb/reader.go
++++ b/component/mmdb/reader.go
+@@ -61,7 +61,11 @@
+ 		case []any: // lookup returned type of slice is []any
+ 			result := make([]string, 0, len(record))
+ 			for _, item := range record {
+-				result = append(result, item.(string))
++				code, ok := item.(string)
++				if !ok {
++					return []string{}
++				}
++				result = append(result, code)
+ 			}
+ 			return result
+ 		}
+@@ -80,7 +84,9 @@
+ 		return fmt.Sprint(result.AutonomousSystemNumber), result.AutonomousSystemOrganization
+ 	case "ipinfo generic_asn_free.mmdb":
+ 		var result IPInfo
+-		_ = r.Lookup(ip, &result)
++		if err := r.Lookup(ip, &result); err != nil || !strings.HasPrefix(result.ASN, "AS") || len(result.ASN) <= 2 {
++			return "0", ""
++		}
+ 		return result.ASN[2:], result.Name
+ 	default:
+ 		log.Warnln("Unsupported ASN type: %s", r.Metadata.DatabaseType)

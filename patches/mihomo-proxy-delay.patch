@@ -1,0 +1,16 @@
+--- a/adapter/adapter.go
++++ b/adapter/adapter.go
+@@ -242,8 +242,12 @@
+ 		TLSClientConfig:       tlsConfig,
+ 	}
+ 
++	timeout := 30 * time.Second
++	if deadline, ok := ctx.Deadline(); ok {
++		timeout = time.Until(deadline)
++	}
+ 	client := http.Client{
+-		Timeout:   30 * time.Second,
++		Timeout:   timeout,
+ 		Transport: transport,
+ 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+ 			return http.ErrUseLastResponse

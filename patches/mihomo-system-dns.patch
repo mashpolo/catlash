@@ -1,0 +1,29 @@
+--- a/dns/util.go
++++ b/dns/util.go
+@@ -112,6 +112,10 @@
+ func isIPRequest(q D.Question) bool {
+ 	return q.Qclass == D.ClassINET && (q.Qtype == D.TypeA || q.Qtype == D.TypeAAAA || q.Qtype == D.TypeCNAME)
+ }
++
++// MobileSystemNameServers returns a startup snapshot, and whether the host supplied it.
++// Only explicit system:// entries consume this snapshot.
++var MobileSystemNameServers func() ([]string, bool)
+ 
+ func transform(servers []NameServer, resolver resolver.Resolver) []dnsClient {
+ 	ret := make([]dnsClient, 0, len(servers))
+@@ -125,6 +129,15 @@
+ 		case "dhcp":
+ 			c = newDHCPClient(s.Addr)
+ 		case "system":
++			if MobileSystemNameServers != nil {
++				if addresses, supplied := MobileSystemNameServers(); supplied {
++					for _, address := range addresses {
++						client := newClient(address, resolver, "udp", s.Params, s.ProxyAdapter, s.ProxyName)
++						ret = append(ret, rewrapClient(client, s.Params))
++					}
++					continue
++				}
++			}
+ 			c = newSystemClient()
+ 		case "tailscale":
+ 			c = newTailscaleClient(s.Addr)

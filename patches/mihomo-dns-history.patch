@@ -1,0 +1,101 @@
+--- a/dns/patch.go
++++ b/dns/patch.go
+@@ -14,6 +14,7 @@
+ )
+ 
+ type QueryRecord struct {
++	Mode      string
+ 	Question  D.Question
+ 	Msg       *D.Msg
+ 	Initiator string
+@@ -48,7 +49,7 @@
+ }
+ 
+ func (r *Resolver) traceCacheHit(ctx context.Context, q D.Question, msg *D.Msg) {
+-	notify := DefaultQueryNotify
++	notify := r.queryNotify()
+ 	if notify == nil {
+ 		return
+ 	}
+@@ -77,7 +78,7 @@
+ type exchangeTraceKey struct{}
+ 
+ func (r *Resolver) traceExchange(ctx context.Context, q D.Question, initiator string) (context.Context, *exchangeTrace) {
+-	notify := DefaultQueryNotify
++	notify := r.queryNotify()
+ 	if notify == nil {
+ 		return ctx, nil
+ 	}
+--- a/dns/service.go
++++ b/dns/service.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"errors"
++	"time"
+ 
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	icontext "github.com/metacubex/mihomo/context"
+@@ -19,7 +20,20 @@
+ 		return nil, errors.New("at least one question is required")
+ 	}
+ 
+-	r, err := s.handler(icontext.NewDNSContext(ctx), msg)
++	started := time.Now()
++	if resolver.InitiatorFrom(ctx) == "" {
++		ctx = resolver.WithInitiator(ctx, resolver.InitiatorApp)
++	}
++	dnsContext := icontext.NewDNSContext(ctx)
++	r, err := s.handler(dnsContext, msg)
++	if mode := dnsContext.Type(); mode == icontext.DNSTypeHost || mode == icontext.DNSTypeFakeIP || mode == "disabled-ipv6" {
++		if notify := queryNotifyFromContext(ctx); notify != nil {
++			if mode == icontext.DNSTypeHost {
++				mode = "hosts"
++			}
++			notify(QueryRecord{Question: msg.Question[0], Msg: r, Initiator: resolver.InitiatorApp, Mode: mode, Start: started, Err: err})
++		}
++	}
+ 	if err != nil {
+ 		return r, err
+ 	}
+--- a/dns/middleware.go
++++ b/dns/middleware.go
+@@ -204,6 +204,7 @@
+ 
+ 		// return a empty AAAA msg when ipv6 disabled
+ 		if !ipv6 && q.Qtype == D.TypeAAAA {
++			ctx.SetType("disabled-ipv6")
+ 			return handleMsgWithEmptyAnswer(r), nil
+ 		}
+ 
+--- /dev/null
++++ b/dns/mobile_query_notify.go
+@@ -0,0 +1,28 @@
++package dns
++
++import "context"
++
++type queryNotifyKey struct{}
++
++func WithQueryNotify(ctx context.Context, notify QueryNotify) context.Context {
++	return context.WithValue(ctx, queryNotifyKey{}, notify)
++}
++
++func queryNotifyFromContext(ctx context.Context) QueryNotify {
++	notify, _ := ctx.Value(queryNotifyKey{}).(QueryNotify)
++	return notify
++}
++
++func (r *Resolver) queryNotify() QueryNotify {
++	if notify := queryNotifyFromContext(r.backgroundContext()); notify != nil {
++		return notify
++	}
++	return DefaultQueryNotify
++}
++
++func (rs Resolvers) ClearSessionCache() {
++	rs.ClearCache()
++	if rs.Resolver != nil {
++		rs.Resolver.defaultResolver.ClearCache()
++	}
++}

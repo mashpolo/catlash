@@ -1,0 +1,57 @@
+--- a/rules/logic/logic.go
++++ b/rules/logic/logic.go
+@@ -179,9 +179,6 @@
+ func matchSubRules(metadata *C.Metadata, name string, subRules map[string][]C.Rule, helper C.RuleMatchHelper) (bool, string) {
+ 	for _, rule := range subRules[name] {
+ 		if m, a := rule.Match(metadata, helper); m {
+-			if rule.RuleType() == C.SubRules {
+-				m, a = matchSubRules(metadata, rule.Adapter(), subRules, helper)
+-			}
+ 			if m && (a == "PASS-RULE" || (helper.CheckPassRule != nil && helper.CheckPassRule(a))) {
+ 				continue 
+ 			}
+--- /dev/null
++++ b/rules/logic/mobile_subrules_test.go
+@@ -0,0 +1,42 @@
++package logic
++
++import (
++	"fmt"
++	C "github.com/metacubex/mihomo/constant"
++	"testing"
++)
++
++type mobileCountingRule struct {
++	C.Rule
++	calls  int
++	target string
++}
++
++func (r *mobileCountingRule) Match(*C.Metadata, C.RuleMatchHelper) (bool, string) {
++	r.calls++
++	return true, r.target
++}
++func (r *mobileCountingRule) RuleType() C.RuleType { return C.MATCH }
++func (r *mobileCountingRule) Adapter() string      { return r.target }
++
++func TestMobileNestedSubRuleEvaluatesLeafOnce(t *testing.T) {
++	for depth := 2; depth <= 5; depth++ {
++		t.Run(fmt.Sprintf("depth-%d", depth), func(t *testing.T) {
++			leaf := &mobileCountingRule{target: "DIRECT"}
++			subRules := map[string][]C.Rule{}
++			var nested C.Rule = leaf
++			for level := 0; level < depth; level++ {
++				name := fmt.Sprintf("nested-%d", level)
++				subRules[name] = []C.Rule{nested}
++				nested = &Logic{ruleType: C.SubRules, adapter: name, subRules: subRules, rules: []C.Rule{&mobileCountingRule{}}}
++			}
++			matched, target := nested.Match(&C.Metadata{}, C.RuleMatchHelper{})
++			if !matched || target != "DIRECT" {
++				t.Fatalf("unexpected result: %v %s", matched, target)
++			}
++			if leaf.calls != 1 {
++				t.Fatalf("depth %d evaluated matching leaf %d times; want 1", depth, leaf.calls)
++			}
++		})
++	}
++}

@@ -1,0 +1,635 @@
+--- /dev/null
++++ b/component/geodata/mobile.go
+@@ -0,0 +1,150 @@
++package geodata
++
++import (
++	"errors"
++	"strings"
++
++	"github.com/metacubex/mihomo/component/geodata/router"
++	"google.golang.org/protobuf/encoding/protowire"
++	"google.golang.org/protobuf/proto"
++)
++
++const mobileGeoMaxBytes = 16 << 20
++const mobileGeoMaxRecords = 200_000
++
++var errMobileGeo = errors.New("invalid, missing or oversized geodata entry")
++
++func mobileGeoEntry(data []byte, code string) ([]byte, error) {
++	if len(data) > mobileGeoMaxBytes || code == "" {
++		return nil, errMobileGeo
++	}
++	var found []byte
++	entries := 0
++	for len(data) > 0 {
++		number, kind, n := protowire.ConsumeTag(data)
++		if n < 0 {
++			return nil, errMobileGeo
++		}
++		data = data[n:]
++		if number != 1 || kind != protowire.BytesType {
++			return nil, errMobileGeo
++		}
++		entry, n := protowire.ConsumeBytes(data)
++		if n < 0 {
++			return nil, errMobileGeo
++		}
++		data = data[n:]
++		entries++
++		if entries > 10_000 {
++			return nil, errMobileGeo
++		}
++		cursor := entry
++		name := ""
++		records := 0
++		for len(cursor) > 0 {
++			field, wire, n := protowire.ConsumeTag(cursor)
++			if n < 0 {
++				return nil, errMobileGeo
++			}
++			cursor = cursor[n:]
++			if field == 1 && wire == protowire.BytesType {
++				value, n := protowire.ConsumeBytes(cursor)
++				if n < 0 || len(value) > 256 || name != "" {
++					return nil, errMobileGeo
++				}
++				name = string(value)
++				cursor = cursor[n:]
++				continue
++			}
++			if field == 2 {
++				records++
++				if records > mobileGeoMaxRecords {
++					return nil, errMobileGeo
++				}
++			}
++			n = protowire.ConsumeFieldValue(field, wire, cursor)
++			if n < 0 {
++				return nil, errMobileGeo
++			}
++			cursor = cursor[n:]
++		}
++		if strings.EqualFold(name, code) {
++			if found != nil {
++				return nil, errMobileGeo
++			}
++			found = entry
++		}
++	}
++	if found == nil {
++		return nil, errMobileGeo
++	}
++	return found, nil
++}
++func NewMobileGeoIPMatcher(data []byte, code string) (router.IPMatcher, error) {
++	code = strings.ToLower(strings.TrimSpace(code))
++	negate := strings.HasPrefix(code, "!")
++	code = strings.TrimPrefix(code, "!")
++	entry, err := mobileGeoEntry(data, code)
++	if err != nil {
++		return nil, err
++	}
++	var geo router.GeoIP
++	if err := (proto.UnmarshalOptions{RecursionLimit: 64}).Unmarshal(entry, &geo); err != nil {
++		return nil, errMobileGeo
++	}
++	matcher, err := router.NewGeoIPMatcher(geo.Cidr)
++	if err != nil {
++		return nil, errMobileGeo
++	}
++	if negate {
++		matcher = router.NewNotIpMatcherGroup(matcher)
++	}
++	return matcher, nil
++}
++func NewMobileGeoSiteMatcher(data []byte, code, algorithm string) (router.DomainMatcher, error) {
++	code = strings.ToLower(code)
++	negate := strings.HasPrefix(code, "!")
++	code = strings.TrimPrefix(code, "!")
++	parts := strings.Split(code, "@")
++	name := strings.TrimSpace(parts[0])
++	attrs := parseAttrs(parts[1:])
++	entry, err := mobileGeoEntry(data, name)
++	if err != nil {
++		return nil, err
++	}
++	var geo router.GeoSite
++	if err := (proto.UnmarshalOptions{RecursionLimit: 64}).Unmarshal(entry, &geo); err != nil {
++		return nil, errMobileGeo
++	}
++	domains := geo.Domain
++	for _, domain := range domains {
++		if domain.Type < router.Domain_Plain || domain.Type > router.Domain_Full {
++			return nil, errMobileGeo
++		}
++	}
++	if !attrs.IsEmpty() {
++		filtered := make([]*router.Domain, 0, len(domains))
++		for _, domain := range domains {
++			if attrs.Match(domain) {
++				filtered = append(filtered, domain)
++			}
++		}
++		domains = filtered
++	}
++	var matcher router.DomainMatcher
++	switch algorithm {
++	case "", "succinct":
++		matcher, err = router.NewSuccinctMatcherGroup(domains)
++	case "mph", "hybrid":
++		matcher, err = router.NewMphMatcherGroup(domains)
++	default:
++		return nil, errors.New("unsupported geosite matcher")
++	}
++	if err != nil {
++		return nil, errMobileGeo
++	}
++	if negate {
++		matcher = router.NewNotDomainMatcherGroup(matcher)
++	}
++	return matcher, nil
++}
+--- a/config/config.go
++++ b/config/config.go
+@@ -1338,7 +1338,7 @@
+ 	}
+ }
+ 
+-func parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], adapterName string, ruleProviders map[string]P.RuleProvider, respectRules bool, preferH3 bool) ([]dns.Policy, error) {
++func parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], adapterName string, ruleProviders map[string]P.RuleProvider, respectRules bool, preferH3 bool, geo ...MobileGeo) ([]dns.Policy, error) {
+ 	var policy []dns.Policy
+ 
+ 	for pair := nsPolicy.Oldest(); pair != nil; pair = pair.Next() {
+@@ -1398,7 +1398,7 @@
+ 			policy[idx] = dns.Policy{Matcher: matcher, NameServers: nameservers}
+ 		} else if strings.HasPrefix(domain, "geosite:") {
+ 			country := domain[8:]
+-			matcher, err := RC.NewGEOSITE(country, adapterName)
++			matcher, err := newDNSGeoSite(country, adapterName, geo)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -1413,7 +1413,7 @@
+ 	return policy, nil
+ }
+ 
+-func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS, error) {
++func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider, geo ...MobileGeo) (*DNS, error) {
+ 	cfg := rawCfg.DNS
+ 	if cfg.Enable && len(cfg.NameServer) == 0 {
+ 		return nil, fmt.Errorf("if DNS configuration is turned on, NameServer cannot be empty")
+@@ -1445,7 +1445,7 @@
+ 		return nil, err
+ 	}
+ 
+-	if dnsCfg.NameServerPolicy, err = parseNameServerPolicy(cfg.NameServerPolicy, "dns.nameserver-policy", ruleProviders, cfg.RespectRules, cfg.PreferH3); err != nil {
++	if dnsCfg.NameServerPolicy, err = parseNameServerPolicy(cfg.NameServerPolicy, "dns.nameserver-policy", ruleProviders, cfg.RespectRules, cfg.PreferH3, geo...); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -1453,7 +1453,7 @@
+ 		return nil, err
+ 	}
+ 
+-	if dnsCfg.ProxyServerPolicy, err = parseNameServerPolicy(cfg.ProxyServerNameserverPolicy, "dns.proxy-server-nameserver-policy", ruleProviders, false, cfg.PreferH3); err != nil {
++	if dnsCfg.ProxyServerPolicy, err = parseNameServerPolicy(cfg.ProxyServerNameserverPolicy, "dns.proxy-server-nameserver-policy", ruleProviders, false, cfg.PreferH3, geo...); err != nil {
+ 		return nil, err
+ 	}
+ 	if len(dnsCfg.ProxyServerPolicy) != 0 && len(dnsCfg.ProxyServerNameserver) == 0 {
+@@ -1524,13 +1524,13 @@
+ 		skipper := &fakeip.Skipper{Mode: cfg.FakeIPFilterMode}
+ 
+ 		if cfg.FakeIPFilterMode == C.FilterRule {
+-			rules, err := parseFakeIPRules(cfg.FakeIPFilter, ruleProviders)
++			rules, err := parseFakeIPRules(cfg.FakeIPFilter, ruleProviders, geo...)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+ 			skipper.Rules = rules
+ 		} else {
+-			host, err := parseDomain(cfg.FakeIPFilter, fakeIPDomainSetBuilder, "dns.fake-ip-filter", ruleProviders)
++			host, err := parseDomain(cfg.FakeIPFilter, fakeIPDomainSetBuilder, "dns.fake-ip-filter", ruleProviders, geo...)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -1571,7 +1571,7 @@
+ 
+ 	if len(cfg.Fallback) != 0 {
+ 		if cfg.FallbackFilter.GeoIP {
+-			matcher, err := RC.NewGEOIP(cfg.FallbackFilter.GeoIPCode, "dns.fallback-filter.geoip", false, true)
++			matcher, err := newDNSGeoIP(cfg.FallbackFilter.GeoIPCode, "dns.fallback-filter.geoip", false, true, geo)
+ 			if err != nil {
+ 				return nil, fmt.Errorf("load GeoIP dns fallback filter error, %w", err)
+ 			}
+@@ -1606,7 +1606,7 @@
+ 		if len(cfg.FallbackFilter.GeoSite) > 0 {
+ 			log.Warnln("replace fallback-filter.geosite with nameserver-policy, it will be removed in the future")
+ 			for idx, geoSite := range cfg.FallbackFilter.GeoSite {
+-				matcher, err := RC.NewGEOSITE(geoSite, "dns.fallback-filter.geosite")
++				matcher, err := newDNSGeoSite(geoSite, "dns.fallback-filter.geosite", geo)
+ 				if err != nil {
+ 					return nil, fmt.Errorf("DNS FallbackGeosite[%d] format error: %w", idx, err)
+ 				}
+@@ -1619,7 +1619,7 @@
+ 	return dnsCfg, nil
+ }
+ 
+-func parseFakeIPRules(rawRules []string, ruleProviders map[string]P.RuleProvider) ([]C.Rule, error) {
++func parseFakeIPRules(rawRules []string, ruleProviders map[string]P.RuleProvider, geo ...MobileGeo) ([]C.Rule, error) {
+ 	var rules []C.Rule
+ 
+ 	for idx, line := range rawRules {
+@@ -1644,12 +1644,12 @@
+ 			}
+ 		}
+ 
+-		parsed, err := R.ParseRule(tp, payload, action, params, nil)
++		parsed, err := newDNSRule(tp, payload, action, params, geo)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("dns.fake-ip-filter[%d] [%s] error: %w", idx, line, err)
+ 		}
+ 
+-		if !isDomainRule(parsed.RuleType()) && parsed.RuleType() != C.MATCH {
++		if !isDomainRule(parsed.RuleType()) && parsed.RuleType() != C.MATCH && !isMobileDomainLogic(parsed.RuleType(), geo) {
+ 			return nil, fmt.Errorf("dns.fake-ip-filter[%d] [%s] error: rule type '%s' not supported, only domain-based rules allowed", idx, line, tp)
+ 		}
+ 
+@@ -1909,7 +1909,7 @@
+ 	return
+ }
+ 
+-func parseDomain(domains []string, domainSetBuilder *trie.DomainSetBuilder, adapterName string, ruleProviders map[string]P.RuleProvider) (matchers []C.DomainMatcher, err error) {
++func parseDomain(domains []string, domainSetBuilder *trie.DomainSetBuilder, adapterName string, ruleProviders map[string]P.RuleProvider, geo ...MobileGeo) (matchers []C.DomainMatcher, err error) {
+ 	var matcher C.DomainMatcher
+ 	for idx, domain := range domains {
+ 		domainLower := strings.ToLower(domain)
+@@ -1918,7 +1918,7 @@
+ 			subkeys = subkeys[1:]
+ 			subkeys = strings.Split(subkeys[0], ",")
+ 			for _, country := range subkeys {
+-				matcher, err = RC.NewGEOSITE(country, adapterName)
++				matcher, err = newDNSGeoSite(country, adapterName, geo)
+ 				if err != nil {
+ 					return nil, fmt.Errorf("%s[%d] %q: %w", adapterName, idx, domain, err)
+ 				}
+--- /dev/null
++++ b/config/mobile_geo.go
+@@ -0,0 +1,50 @@
++package config
++
++import (
++	C "github.com/metacubex/mihomo/constant"
++	R "github.com/metacubex/mihomo/rules"
++	RC "github.com/metacubex/mihomo/rules/common"
++)
++
++type MobileGeo interface {
++	NewGeoIP(country, target string, source, noResolve bool) (*RC.GEOIP, error)
++	NewGeoSite(country, target string) (*RC.GEOSITE, error)
++}
++
++func newDNSGeoIP(country, target string, source, noResolve bool, geo []MobileGeo) (*RC.GEOIP, error) {
++	if len(geo) > 0 && geo[0] != nil {
++		return geo[0].NewGeoIP(country, target, source, noResolve)
++	}
++	return RC.NewGEOIP(country, target, source, noResolve)
++}
++func newDNSGeoSite(country, target string, geo []MobileGeo) (*RC.GEOSITE, error) {
++	if len(geo) > 0 && geo[0] != nil {
++		return geo[0].NewGeoSite(country, target)
++	}
++	return RC.NewGEOSITE(country, target)
++}
++
++type mobileDNSRuleParser interface {
++	ParseDNSRule(kind, payload, target string, params []string) (C.Rule, error)
++}
++
++func newDNSRule(kind, payload, target string, params []string, geo []MobileGeo) (C.Rule, error) {
++	if len(geo) > 0 {
++		if parser, ok := geo[0].(mobileDNSRuleParser); ok {
++			return parser.ParseDNSRule(kind, payload, target, params)
++		}
++	}
++	if kind == "GEOSITE" && len(geo) > 0 {
++		return newDNSGeoSite(payload, target, geo)
++	}
++	return R.ParseRule(kind, payload, target, params, nil)
++}
++func isMobileDomainLogic(kind C.RuleType, geo []MobileGeo) bool {
++	if len(geo) == 0 {
++		return false
++	}
++	if _, ok := geo[0].(mobileDNSRuleParser); !ok {
++		return false
++	}
++	return kind == C.AND || kind == C.OR || kind == C.NOT
++}
+--- a/rules/common/geoip.go
++++ b/rules/common/geoip.go
+@@ -17,10 +17,12 @@
+ 
+ type GEOIP struct {
+ 	Base
+-	country     string
+-	adapter     string
+-	noResolveIP bool
+-	isSourceIP  bool
++	mobileMatcher router.IPMatcher
++	mobileReader  *mmdb.IPReader
++	country       string
++	adapter       string
++	noResolveIP   bool
++	isSourceIP    bool
+ }
+ 
+ var _ C.Rule = (*GEOIP)(nil)
+@@ -49,7 +51,7 @@
+ 		return g.isLan(ip), g.adapter
+ 	}
+ 
+-	if geodata.GeodataMode() {
++	if g.mobileMatcher != nil || (g.mobileReader == nil && geodata.GeodataMode()) {
+ 		if g.isSourceIP {
+ 			if slices.Contains(metadata.SrcGeoIP, g.country) {
+ 				return true, g.adapter
+@@ -83,7 +85,7 @@
+ 			return slices.Contains(metadata.DstGeoIP, g.country), g.adapter
+ 		}
+ 	}
+-	codes := mmdb.IPInstance().LookupCode(ip.AsSlice())
++	codes := g.lookupCode(ip)
+ 	if g.isSourceIP {
+ 		metadata.SrcGeoIP = codes
+ 	} else {
+@@ -105,7 +107,7 @@
+ 		return g.isLan(ip)
+ 	}
+ 
+-	if geodata.GeodataMode() {
++	if g.mobileMatcher != nil || (g.mobileReader == nil && geodata.GeodataMode()) {
+ 		matcher, err := g.getIPMatcher()
+ 		if err != nil {
+ 			return false
+@@ -113,7 +115,7 @@
+ 		return matcher.Match(ip)
+ 	}
+ 
+-	codes := mmdb.IPInstance().LookupCode(ip.AsSlice())
++	codes := g.lookupCode(ip)
+ 	return slices.Contains(codes, g.country)
+ }
+ 
+@@ -131,7 +133,7 @@
+ 		return !g.isLan(ip)
+ 	}
+ 
+-	if geodata.GeodataMode() {
++	if g.mobileMatcher != nil || (g.mobileReader == nil && geodata.GeodataMode()) {
+ 		matcher, err := g.getIPMatcher()
+ 		if err != nil {
+ 			return false
+@@ -139,7 +141,7 @@
+ 		return !matcher.Match(ip)
+ 	}
+ 
+-	codes := mmdb.IPInstance().LookupCode(ip.AsSlice())
++	codes := g.lookupCode(ip)
+ 	return !slices.Contains(codes, g.country)
+ }
+ 
+@@ -172,13 +174,16 @@
+ }
+ 
+ func (g *GEOIP) GetIPMatcher() (router.IPMatcher, error) {
+-	if geodata.GeodataMode() {
++	if g.mobileMatcher != nil || (g.mobileReader == nil && geodata.GeodataMode()) {
+ 		return g.getIPMatcher()
+ 	}
+ 	return nil, errors.New("not geodata mode")
+ }
+ 
+ func (g *GEOIP) getIPMatcher() (router.IPMatcher, error) {
++	if g.mobileMatcher != nil {
++		return g.mobileMatcher, nil
++	}
+ 	geoIPMatcher, err := geodata.LoadGeoIPMatcher(g.country)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("[GeoIP] %w", err)
+@@ -231,3 +236,10 @@
+ }
+ 
+ var _ C.Rule = (*GEOIP)(nil)
++
++func (g *GEOIP) lookupCode(ip netip.Addr) []string {
++	if g.mobileReader != nil {
++		return g.mobileReader.LookupCode(ip.AsSlice())
++	}
++	return mmdb.IPInstance().LookupCode(ip.AsSlice())
++}
+--- a/rules/common/geosite.go
++++ b/rules/common/geosite.go
+@@ -13,9 +13,10 @@
+ 
+ type GEOSITE struct {
+ 	Base
+-	country    string
+-	adapter    string
+-	recodeSize int
++	mobileMatcher router.DomainMatcher
++	country       string
++	adapter       string
++	recodeSize    int
+ }
+ 
+ func (gs *GEOSITE) RuleType() C.RuleType {
+@@ -47,6 +48,9 @@
+ }
+ 
+ func (gs *GEOSITE) GetDomainMatcher() (router.DomainMatcher, error) {
++	if gs.mobileMatcher != nil {
++		return gs.mobileMatcher, nil
++	}
+ 	matcher, err := geodata.LoadGeoSiteMatcher(gs.country)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("load GeoSite data error, %w", err)
+--- a/rules/common/ipasn.go
++++ b/rules/common/ipasn.go
+@@ -9,10 +9,11 @@
+ 
+ type ASN struct {
+ 	Base
+-	asn         string
+-	adapter     string
+-	noResolveIP bool
+-	isSourceIP  bool
++	mobileReader *mmdb.ASNReader
++	asn          string
++	adapter      string
++	noResolveIP  bool
++	isSourceIP   bool
+ }
+ 
+ func (a *ASN) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, string) {
+@@ -28,7 +29,12 @@
+ 		return false, ""
+ 	}
+ 
+-	asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
++	reader := a.mobileReader
++	if reader == nil {
++		value := mmdb.ASNInstance()
++		reader = &value
++	}
++	asn, aso := reader.LookupASN(ip.AsSlice())
+ 	if a.isSourceIP {
+ 		metadata.SrcIPASN = asn + " " + aso
+ 	} else {
+--- /dev/null
++++ b/rules/common/mobile_geo.go
+@@ -0,0 +1,17 @@
++package common
++
++import (
++	"github.com/metacubex/mihomo/component/geodata/router"
++	"github.com/metacubex/mihomo/component/mmdb"
++	"strings"
++)
++
++func NewMobileGEOIP(country, target string, source, noResolve bool, matcher router.IPMatcher, reader *mmdb.IPReader) *GEOIP {
++	return &GEOIP{country: strings.ToLower(country), adapter: target, isSourceIP: source, noResolveIP: noResolve, mobileMatcher: matcher, mobileReader: reader}
++}
++func NewMobileGEOSITE(country, target string, matcher router.DomainMatcher) *GEOSITE {
++	return &GEOSITE{country: country, adapter: target, mobileMatcher: matcher}
++}
++func NewMobileIPASN(asn, target string, source, noResolve bool, reader *mmdb.ASNReader) *ASN {
++	return &ASN{asn: asn, adapter: target, isSourceIP: source, noResolveIP: noResolve, mobileReader: reader}
++}
+--- /dev/null
++++ b/component/geodata/mobile_file.go
+@@ -0,0 +1,123 @@
++package geodata
++
++import (
++	"bufio"
++	"encoding/binary"
++	"io"
++	"os"
++	"strings"
++
++	"github.com/metacubex/mihomo/component/geodata/router"
++	"google.golang.org/protobuf/encoding/protowire"
++)
++
++// Read only entry headers and the requested country, rather than loading the DAT.
++func NewMobileGeoIPMatcherFromFile(path, code string) (router.IPMatcher, error) {
++	name := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(code)), "!")
++	if name == "" {
++		return nil, errMobileGeo
++	}
++	file, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil || !info.Mode().IsRegular() {
++		return nil, errMobileGeo
++	}
++	var foundOffset, foundLength int64
++	var offset int64
++	entries := 0
++	for offset < info.Size() {
++		entries++
++		if entries > 10_000 {
++			return nil, errMobileGeo
++		}
++		var header [20]byte
++		count, err := file.ReadAt(header[:], offset)
++		if err != nil && err != io.EOF {
++			return nil, errMobileGeo
++		}
++		field, wire, tagSize := protowire.ConsumeTag(header[:count])
++		if tagSize < 0 || field != 1 || wire != protowire.BytesType {
++			return nil, errMobileGeo
++		}
++		length, lengthSize := protowire.ConsumeVarint(header[tagSize:count])
++		if lengthSize < 0 {
++			return nil, errMobileGeo
++		}
++		headerSize := int64(tagSize + lengthSize)
++		if length > uint64(info.Size()-offset-headerSize) {
++			return nil, errMobileGeo
++		}
++		size := int64(length)
++		entryName, err := mobileGeoFileEntryName(io.NewSectionReader(file, offset+headerSize, size))
++		if err != nil {
++			return nil, errMobileGeo
++		}
++		if strings.EqualFold(entryName, name) {
++			if foundLength != 0 || size+headerSize > mobileGeoMaxBytes {
++				return nil, errMobileGeo
++			}
++			foundOffset, foundLength = offset, headerSize+size
++		}
++		offset += headerSize + size
++	}
++	if foundLength == 0 {
++		return nil, errMobileGeo
++	}
++	data := make([]byte, int(foundLength))
++	if _, err := file.ReadAt(data, foundOffset); err != nil {
++		return nil, errMobileGeo
++	}
++	return NewMobileGeoIPMatcher(data, code)
++}
++
++func mobileGeoFileEntryName(section io.Reader) (string, error) {
++	reader := bufio.NewReaderSize(section, 512)
++	for {
++		tag, err := binary.ReadUvarint(reader)
++		if err == io.EOF {
++			return "", nil
++		}
++		if err != nil {
++			return "", errMobileGeo
++		}
++		field, wire := protowire.DecodeTag(tag)
++		switch wire {
++		case protowire.VarintType:
++			if _, err := binary.ReadUvarint(reader); err != nil {
++				return "", errMobileGeo
++			}
++		case protowire.Fixed64Type:
++			if _, err := io.CopyN(io.Discard, reader, 8); err != nil {
++				return "", errMobileGeo
++			}
++		case protowire.Fixed32Type:
++			if _, err := io.CopyN(io.Discard, reader, 4); err != nil {
++				return "", errMobileGeo
++			}
++		case protowire.BytesType:
++			length, err := binary.ReadUvarint(reader)
++			if err != nil || length > uint64(^uint64(0)>>1) {
++				return "", errMobileGeo
++			}
++			if field == 1 {
++				if length > 256 {
++					return "", errMobileGeo
++				}
++				value := make([]byte, int(length))
++				if _, err := io.ReadFull(reader, value); err != nil {
++					return "", errMobileGeo
++				}
++				return string(value), nil
++			}
++			if _, err := io.CopyN(io.Discard, reader, int64(length)); err != nil {
++				return "", errMobileGeo
++			}
++		default:
++			return "", errMobileGeo
++		}
++	}
++}

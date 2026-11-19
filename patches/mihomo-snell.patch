@@ -1,0 +1,428 @@
+--- a/component/pool/pool.go
++++ b/component/pool/pool.go
+@@ -2,9 +2,13 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"runtime"
++	"sync"
+ 	"time"
+ )
++
++var ErrClosed = errors.New("pool closed")
+ 
+ type Factory[T any] func(context.Context) (T, error)
+ 
+@@ -42,29 +46,81 @@
+ }
+ 
+ type pool[T any] struct {
+-	ch      chan *entry[T]
+-	factory Factory[T]
+-	evict   func(T)
+-	maxAge  int64
++	mu        sync.Mutex
++	closed    bool
++	closeOnce sync.Once
++	workers   sync.WaitGroup
++	ctx       context.Context
++	cancel    context.CancelFunc
++	ch        chan *entry[T]
++	factory   Factory[T]
++	evict     func(T)
++	maxAge    int64
+ }
+ 
+ func (p *pool[T]) GetContext(ctx context.Context) (T, error) {
+-	now := time.Now()
++	var zero T
++	p.mu.Lock()
++	if p.closed {
++		p.mu.Unlock()
++		return zero, ErrClosed
++	}
++	p.workers.Add(1)
++	p.mu.Unlock()
++	defer p.workers.Done()
+ 	for {
++		p.mu.Lock()
++		if p.closed {
++			p.mu.Unlock()
++			return zero, ErrClosed
++		}
++		if err := ctx.Err(); err != nil {
++			p.mu.Unlock()
++			return zero, err
++		}
++		var item *entry[T]
+ 		select {
+-		case item := <-p.ch:
+-			elm := item
+-			if p.maxAge != 0 && now.Sub(item.time).Milliseconds() > p.maxAge {
+-				if p.evict != nil {
+-					p.evict(elm.elm)
+-				}
+-				continue
+-			}
++		case item = <-p.ch:
++		default:
++		}
++		p.mu.Unlock()
++		if item == nil {
++			return p.create(ctx)
++		}
++		if p.maxAge != 0 && time.Since(item.time).Milliseconds() > p.maxAge {
++			p.evictItem(item.elm)
++			continue
++		}
++		return item.elm, nil
++	}
++}
+ 
+-			return elm.elm, nil
+-		default:
+-			return p.factory(ctx)
++func (p *pool[T]) create(ctx context.Context) (T, error) {
++	ctx, cancel := context.WithCancel(ctx)
++	stop := context.AfterFunc(p.ctx, cancel)
++	defer stop()
++	defer cancel()
++	item, err := p.factory(ctx)
++	if err != nil {
++		return item, err
++	}
++	p.mu.Lock()
++	closed := p.closed
++	p.mu.Unlock()
++	if closed || ctx.Err() != nil {
++		p.evictItem(item)
++		var zero T
++		if closed {
++			return zero, ErrClosed
+ 		}
++		return zero, ctx.Err()
++	}
++	return item, nil
++}
++
++func (p *pool[T]) evictItem(item T) {
++	if p.evict != nil {
++		p.evict(item)
+ 	}
+ }
+ 
+@@ -73,33 +129,49 @@
+ }
+ 
+ func (p *pool[T]) Put(item T) {
+-	e := &entry[T]{
+-		elm:  item,
+-		time: time.Now(),
++	p.mu.Lock()
++	if p.closed {
++		p.mu.Unlock()
++		p.evictItem(item)
++		return
+ 	}
+-
++	p.workers.Add(1)
++	defer p.workers.Done()
+ 	select {
+-	case p.ch <- e:
+-		return
++	case p.ch <- &entry[T]{elm: item, time: time.Now()}:
++		p.mu.Unlock()
+ 	default:
+-		// pool is full
+-		if p.evict != nil {
+-			p.evict(item)
+-		}
+-		return
++		p.mu.Unlock()
++		p.evictItem(item)
+ 	}
+ }
+ 
+-func recycle[T any](p *Pool[T]) {
+-	for item := range p.pool.ch {
+-		if p.pool.evict != nil {
+-			p.pool.evict(item.elm)
++func (p *Pool[T]) Close() error {
++	runtime.SetFinalizer(p, nil)
++	p.closeOnce.Do(func() {
++		p.mu.Lock()
++		p.closed = true
++		p.cancel()
++		p.mu.Unlock()
++		p.workers.Wait()
++		for {
++			select {
++			case item := <-p.ch:
++				p.evictItem(item.elm)
++			default:
++				return
++			}
+ 		}
+-	}
++	})
++	return nil
+ }
+ 
++func recycle[T any](p *Pool[T]) { _ = p.Close() }
++
+ func New[T any](factory Factory[T], options ...Option[T]) *Pool[T] {
++	ctx, cancel := context.WithCancel(context.Background())
+ 	p := &pool[T]{
++		ctx: ctx, cancel: cancel,
+ 		ch:      make(chan *entry[T], 10),
+ 		factory: factory,
+ 	}
+--- a/transport/snell/pool.go
++++ b/transport/snell/pool.go
+@@ -34,6 +34,8 @@
+ 
+ 	return &PoolConn{Snell: elm, pool: p}, nil
+ }
++
++func (p *Pool) Close() error { return p.pool.Close() }
+ 
+ func (p *Pool) Put(conn *Snell) {
+ 	if err := HalfClose(conn); err != nil {
+--- a/adapter/outbound/snell.go
++++ b/adapter/outbound/snell.go
+@@ -101,7 +101,7 @@
+ // DialContext implements C.ProxyAdapter
+ func (s *Snell) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+ 	if s.reuse {
+-		c, err := s.pool.Get()
++		c, err := s.pool.GetContext(ctx)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -162,6 +162,13 @@
+ 	info := s.Base.ProxyInfo()
+ 	info.DialerProxy = s.option.DialerProxy
+ 	return info
++}
++
++func (s *Snell) Close() error {
++	if s.pool != nil {
++		return s.pool.Close()
++	}
++	return nil
+ }
+ 
+ func NewSnell(option SnellOption) (*Snell, error) {
+--- /dev/null
++++ b/component/pool/mobile_close_test.go
+@@ -0,0 +1,137 @@
++package pool
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func mobilePoolClose(t *testing.T, p any) func() error {
++	t.Helper()
++	closer, ok := p.(interface{ Close() error })
++	if !ok {
++		t.Fatal("pool has no explicit Close")
++	}
++	return closer.Close
++}
++
++func TestMobilePoolRecycleReturnsAfterDrain(t *testing.T) {
++	var evicted atomic.Int32
++	p := New(func(context.Context) (int, error) { return 0, nil }, WithEvict(func(int) { evicted.Add(1) }))
++	p.Put(1)
++	done := make(chan struct{})
++	go func() { recycle(p); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(50 * time.Millisecond):
++		t.Fatal("recycle blocked after draining cached item")
++	}
++	if evicted.Load() != 1 {
++		t.Fatal("cached item not evicted")
++	}
++}
++
++func TestMobilePoolCloseWaitsForEvictionAndRejectsReuse(t *testing.T) {
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	var releaseOnce sync.Once
++	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
++	var evicted atomic.Int32
++	var factoryCalls atomic.Int32
++	p := New(func(context.Context) (int, error) { factoryCalls.Add(1); return 99, nil }, WithEvict(func(item int) {
++		evicted.Add(1)
++		if item == 1 {
++			close(entered)
++			<-release
++		}
++	}))
++	closePool := mobilePoolClose(t, p)
++	p.Put(1)
++	first := make(chan struct{})
++	go func() { closePool(); close(first) }()
++	<-entered
++	second := make(chan struct{})
++	go func() { closePool(); close(second) }()
++	select {
++	case <-second:
++		t.Error("concurrent Close returned before eviction finished")
++	case <-time.After(20 * time.Millisecond):
++	}
++	if _, err := p.Get(); err == nil {
++		t.Error("closed pool accepted Get")
++	}
++	p.Put(2)
++	releaseOnce.Do(func() { close(release) })
++	for _, done := range []chan struct{}{first, second} {
++		select {
++		case <-done:
++		case <-time.After(time.Second):
++			t.Fatal("Close did not finish")
++		}
++	}
++	if factoryCalls.Load() != 0 || evicted.Load() != 2 {
++		t.Fatalf("factory=%d evictions=%d", factoryCalls.Load(), evicted.Load())
++	}
++}
++
++func TestMobilePoolCloseCancelsAndWaitsForFactory(t *testing.T) {
++	entered := make(chan struct{})
++	cancelled := make(chan struct{})
++	release := make(chan struct{})
++	var releaseOnce sync.Once
++	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
++	var evicted atomic.Int32
++	p := New(func(ctx context.Context) (int, error) {
++		close(entered)
++		<-ctx.Done()
++		close(cancelled)
++		<-release
++		return 42, nil
++	}, WithEvict(func(int) { evicted.Add(1) }))
++	closePool := mobilePoolClose(t, p)
++	result := make(chan error, 1)
++	go func() { _, err := p.Get(); result <- err }()
++	<-entered
++	closed := make(chan struct{})
++	go func() { closePool(); close(closed) }()
++	select {
++	case <-cancelled:
++	case <-time.After(time.Second):
++		t.Fatal("factory context not cancelled")
++	}
++	select {
++	case <-closed:
++		t.Error("Close returned before factory finished")
++	case <-time.After(20 * time.Millisecond):
++	}
++	releaseOnce.Do(func() { close(release) })
++	if err := <-result; err == nil {
++		t.Fatal("late factory value escaped closed pool")
++	}
++	select {
++	case <-closed:
++	case <-time.After(time.Second):
++		t.Fatal("Close did not join factory")
++	}
++	if evicted.Load() != 1 {
++		t.Fatal("late factory item was not evicted")
++	}
++}
++
++func TestMobilePoolCancelledContextDoesNotCheckout(t *testing.T) {
++	p := New(func(context.Context) (int, error) { return 2, nil })
++	closePool := mobilePoolClose(t, p)
++	defer closePool()
++	p.Put(1)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := p.GetContext(ctx); !errors.Is(err, context.Canceled) {
++		t.Fatalf("expected cancellation, got %v", err)
++	}
++	if value, err := p.Get(); err != nil || value != 1 {
++		t.Fatalf("cancelled checkout consumed cached value: %d %v", value, err)
++	}
++}
+--- /dev/null
++++ b/adapter/outbound/mobile_snell_test.go
+@@ -0,0 +1,69 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++	"github.com/metacubex/mihomo/transport/snell"
++)
++
++func TestMobileSnellReuseHonorsDialContext(t *testing.T) {
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	defer close(release)
++	s := &Snell{reuse: true, pool: snell.NewPool(func(ctx context.Context) (*snell.Snell, error) {
++		close(entered)
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-release:
++			return nil, errors.New("fixture released")
++		}
++	})}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	result := make(chan error, 1)
++	go func() { _, err := s.DialContext(ctx, &C.Metadata{}); result <- err }()
++	<-entered
++	cancel()
++	select {
++	case err := <-result:
++		if !errors.Is(err, context.Canceled) {
++			t.Fatal(err)
++		}
++	case <-time.After(50 * time.Millisecond):
++		t.Error("Snell reuse discarded caller cancellation")
++	}
++}
++
++func TestMobileSnellCloseCancelsPendingPoolDial(t *testing.T) {
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	defer close(release)
++	s := &Snell{reuse: true, pool: snell.NewPool(func(ctx context.Context) (*snell.Snell, error) {
++		close(entered)
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-release:
++			return nil, errors.New("fixture released")
++		}
++	})}
++	result := make(chan error, 1)
++	go func() { _, err := s.DialContext(context.Background(), &C.Metadata{}); result <- err }()
++	<-entered
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case err := <-result:
++		if err == nil {
++			t.Fatal("closed Snell accepted a pending dial")
++		}
++	case <-time.After(50 * time.Millisecond):
++		t.Error("Snell.Close did not release pending pool dial")
++	}
++}

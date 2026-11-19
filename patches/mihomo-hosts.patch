@@ -1,0 +1,92 @@
+--- a/component/resolver/resolver.go
++++ b/component/resolver/resolver.go
+@@ -32,7 +32,9 @@
+ 	DisableIPv6 = true
+ 
+ 	// DefaultHosts aim to resolve hosts
+-	DefaultHosts = NewHosts(trie.New[HostValue]())
++	DefaultHosts interface {
++		Search(string, bool) (*HostValue, bool)
++	} = NewHosts(trie.New[HostValue]())
+ 
+ 	// DefaultDNSTimeout defined the default dns request timeout
+ 	DefaultDNSTimeout = time.Second * 5
+--- a/component/resolver/host.go
++++ b/component/resolver/host.go
+@@ -29,7 +29,7 @@
+ }
+ 
+ // Return the search result and whether to match the parameter `isDomain`
+-func (h *Hosts) Search(domain string, isDomain bool) (*HostValue, bool) {
++func (h Hosts) Search(domain string, isDomain bool) (*HostValue, bool) {
+ 	if value := h.DomainTrie.Search(domain); value != nil {
+ 		hostValue := value.Data()
+ 		for {
+--- a/config/config.go
++++ b/config/config.go
+@@ -1167,19 +1167,13 @@
+ 			if err != nil {
+ 				return nil, fmt.Errorf("%s is not a valid value", anyValue)
+ 			}
+-			if value.IsDomain {
+-				node := tree.Search(value.Domain)
+-				for node != nil && node.Data().IsDomain {
+-					if node.Data().Domain == domain {
+-						return nil, fmt.Errorf("%s, there is a cycle in domain name mapping", domain)
+-					}
+-					node = tree.Search(node.Data().Domain)
+-				}
+-			}
+ 			if err := tree.Insert(domain, value); err != nil {
+ 				log.Warnln("skip invalid hosts entry: %s", err)
+ 			}
+ 		}
++	}
++	if err := validateMobileHosts(tree); err != nil {
++		return nil, err
+ 	}
+ 	tree.Optimize()
+ 
+--- /dev/null
++++ b/config/mobile_hosts.go
+@@ -0,0 +1,40 @@
++package config
++
++import (
++	"errors"
++
++	"github.com/metacubex/mihomo/component/resolver"
++	"github.com/metacubex/mihomo/component/trie"
++)
++
++func ParseMobileHosts(raw *RawConfig) (*trie.DomainTrie[resolver.HostValue], error) {
++	return parseHosts(raw)
++}
++
++func validateMobileHosts(tree *trie.DomainTrie[resolver.HostValue]) error {
++	states := map[*trie.Node[resolver.HostValue]]uint8{}
++	var visit func(*trie.Node[resolver.HostValue]) bool
++	visit = func(node *trie.Node[resolver.HostValue]) bool {
++		if node == nil || !node.Data().IsDomain || states[node] == 2 {
++			return true
++		}
++		if states[node] == 1 {
++			return false
++		}
++		states[node] = 1
++		if !visit(tree.Search(node.Data().Domain)) {
++			return false
++		}
++		states[node] = 2
++		return true
++	}
++	valid := true
++	tree.Foreach(func(_ string, value resolver.HostValue) bool {
++		valid = valid && (!value.IsDomain || visit(tree.Search(value.Domain)))
++		return valid
++	})
++	if !valid {
++		return errors.New("hosts contains a cycle in domain name mapping")
++	}
++	return nil
++}

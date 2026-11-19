@@ -1,0 +1,159 @@
+--- a/component/fakeip/pool.go
++++ b/component/fakeip/pool.go
+@@ -29,14 +29,15 @@
+ 
+ // Pool is an implementation about fake ip generator without storage
+ type Pool struct {
+-	gateway netip.Addr
+-	first   netip.Addr
+-	last    netip.Addr
+-	offset  netip.Addr
+-	cycle   bool
+-	mux     sync.Mutex
+-	ipnet   netip.Prefix
+-	store   store
++	gateway        netip.Addr
++	first          netip.Addr
++	last           netip.Addr
++	offset         netip.Addr
++	cycle          bool
++	mux            sync.Mutex
++	ipnet          netip.Prefix
++	store          store
++	memoryRevision uint64
+ }
+ 
+ // Lookup return a fake ip with host
+@@ -103,6 +104,7 @@
+ }
+ 
+ func (p *Pool) get(host string) netip.Addr {
++	p.memoryRevision++
+ 	p.offset = p.offset.Next()
+ 
+ 	if !p.offset.Less(p.last) {
+@@ -119,8 +121,11 @@
+ }
+ 
+ func (p *Pool) FlushFakeIP() error {
++	p.mux.Lock()
++	defer p.mux.Unlock()
+ 	err := p.store.FlushFakeIP()
+ 	if err == nil {
++		p.memoryRevision++
+ 		p.cycle = false
+ 		p.offset = p.first.Prev()
+ 	}
+--- a/config/mobile_dns.go
++++ b/config/mobile_dns.go
+@@ -7,7 +7,9 @@
+ )
+ 
+ func ParseMobileDNS(raw *RawConfig, providers map[string]P.RuleProvider, geo MobileGeo) (*DNS, error) {
+-	parsed, err := parseDNS(raw, providers, geo)
++	copy := *raw
++	copy.Profile.StoreFakeIP = false
++	parsed, err := parseDNS(&copy, providers, geo)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+--- /dev/null
++++ b/common/lru/mobile_snapshot.go
+@@ -0,0 +1,16 @@
++package lru
++
++type SnapshotEntry[K comparable, V any] struct {
++	Key   K
++	Value V
++}
++
++func (c *LruCache[K, V]) Snapshot() []SnapshotEntry[K, V] {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	entries := make([]SnapshotEntry[K, V], 0, len(c.cache))
++	for item := c.lru.Front(); item != nil; item = item.Next() {
++		entries = append(entries, SnapshotEntry[K, V]{Key: item.Value.key, Value: item.Value.value})
++	}
++	return entries
++}
+--- /dev/null
++++ b/component/fakeip/mobile_state.go
+@@ -0,0 +1,78 @@
++package fakeip
++
++import (
++	"errors"
++	"net/netip"
++	"strings"
++)
++
++type MemoryEntry struct {
++	IP   netip.Addr `json:"ip"`
++	Host string     `json:"host"`
++}
++
++type MemoryState struct {
++	Prefix  netip.Prefix  `json:"prefix"`
++	Offset  netip.Addr    `json:"offset"`
++	Cycle   bool          `json:"cycle"`
++	Entries []MemoryEntry `json:"entries"`
++}
++
++func (p *Pool) MemoryRevision() uint64 {
++	p.mux.Lock()
++	defer p.mux.Unlock()
++	return p.memoryRevision
++}
++
++func (p *Pool) ExportMemoryState() (MemoryState, uint64, error) {
++	p.mux.Lock()
++	defer p.mux.Unlock()
++	memory, ok := p.store.(*memoryStore)
++	if !ok {
++		return MemoryState{}, 0, errors.New("Fake-IP state requires an in-memory pool")
++	}
++	state := MemoryState{Prefix: p.ipnet, Offset: p.offset, Cycle: p.cycle}
++	for _, item := range memory.cacheHost.Snapshot() {
++		state.Entries = append(state.Entries, MemoryEntry{IP: item.Key, Host: item.Value})
++	}
++	return state, p.memoryRevision, nil
++}
++
++func (p *Pool) ImportMemoryState(state MemoryState) error {
++	p.mux.Lock()
++	defer p.mux.Unlock()
++	if _, ok := p.store.(*memoryStore); !ok {
++		return errors.New("Fake-IP state requires an in-memory pool")
++	}
++	if len(state.Entries) > 1000 {
++		return errors.New("Fake-IP state exceeds the pool limit")
++	}
++	if !state.Prefix.IsValid() {
++		return errors.New("invalid Fake-IP network state")
++	}
++	if state.Prefix != p.ipnet {
++		return nil
++	}
++	if !state.Offset.IsValid() || state.Offset.Less(p.first.Prev()) || !state.Offset.Less(p.last) {
++		return errors.New("invalid Fake-IP allocation state")
++	}
++	hosts := make(map[string]bool, len(state.Entries))
++	addresses := make(map[netip.Addr]bool, len(state.Entries))
++	for _, entry := range state.Entries {
++		if entry.Host == "" || len(entry.Host) > 253 || strings.ContainsAny(entry.Host, "\x00\r\n") || strings.ToLower(entry.Host) != entry.Host ||
++			!entry.IP.IsValid() || entry.IP.Less(p.first) || !entry.IP.Less(p.last) || (!state.Cycle && state.Offset.Less(entry.IP)) || hosts[entry.Host] || addresses[entry.IP] {
++			return errors.New("invalid Fake-IP mapping state")
++		}
++		hosts[entry.Host], addresses[entry.IP] = true, true
++	}
++	if err := p.store.FlushFakeIP(); err != nil {
++		return err
++	}
++	for _, entry := range state.Entries {
++		p.store.PutByIP(entry.IP, entry.Host)
++		p.store.PutByHost(entry.Host, entry.IP)
++	}
++	p.offset, p.cycle = state.Offset, state.Cycle
++	p.memoryRevision++
++	return nil
++}

@@ -1,0 +1,25 @@
+build/
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+.DS_Store
+
+# Local project notes, documents and review artifacts
+*.md
+!/README.md
+/docs/
+*.rst
+*.adoc
+*.doc
+*.docx
+*.pdf
+*.pptx
+*.xcresult/
+/*.png
+
+# Upstream databases are downloaded before building.
+/Resources/Geo/*.mmdb
+/Resources/Geo/*.dat
+/Resources/Geo/*.sha256
+/Resources/Geo/*SOURCE.json

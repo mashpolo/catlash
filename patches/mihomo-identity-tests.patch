@@ -1,0 +1,168 @@
+diff --git a/adapter/outbound/mobile_zerotier_test.go b/adapter/outbound/mobile_zerotier_test.go
+new file mode 100644
+--- /dev/null
++++ b/adapter/outbound/mobile_zerotier_test.go
+@@ -0,0 +1,163 @@
++//go:build !no_zerotier
++
++package outbound
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++)
++
++type mobileBlockingZTStack struct {
++	ipStack
++	entered     chan struct{}
++	release     chan struct{}
++	once        sync.Once
++	releaseOnce sync.Once
++}
++
++func (s *mobileBlockingZTStack) unblock() { s.releaseOnce.Do(func() { close(s.release) }) }
++
++func (s *mobileBlockingZTStack) Close() error {
++	s.once.Do(func() { close(s.entered) })
++	<-s.release
++	return nil
++}
++
++func mobileZTForClose(t *testing.T) (*ZeroTier, *mobileBlockingZTStack) {
++	t.Helper()
++	ctx, cancel := context.WithCancel(context.Background())
++	t.Cleanup(cancel)
++	stack := &mobileBlockingZTStack{entered: make(chan struct{}), release: make(chan struct{})}
++	t.Cleanup(stack.unblock)
++	return &ZeroTier{ctx: ctx, cancel: cancel, tunDevice: stack, stateCh: make(chan struct{})}, stack
++}
++
++func mobileWaitZT(t *testing.T, done <-chan struct{}, operation string) {
++	t.Helper()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatalf("%s did not complete", operation)
++	}
++}
++
++func mobileCloseZT(z *ZeroTier) <-chan struct{} {
++	done := make(chan struct{})
++	go func() { defer close(done); z.Close() }()
++	return done
++}
++
++func mobileAssertZTPending(t *testing.T, done <-chan struct{}) {
++	t.Helper()
++	select {
++	case <-done:
++		t.Error("Close returned while owned work was still blocked")
++	case <-time.After(20 * time.Millisecond):
++	}
++}
++
++func TestMobileZeroTierWaitsForDetachedStackClose(t *testing.T) {
++	for _, invalidateDevice := range []bool{false, true} {
++		t.Run(map[bool]string{false: "network-failure", true: "device-failure"}[invalidateDevice], func(t *testing.T) {
++			z, stack := mobileZTForClose(t)
++			if invalidateDevice {
++				z.invalidateDevice(stack, errors.New("fixture failure"))
++			} else {
++				z.invalidateNetwork(nil, errors.New("fixture failure"), "", false)
++			}
++			mobileWaitZT(t, stack.entered, "detached device.Close")
++			done := mobileCloseZT(z)
++			mobileWaitZT(t, z.ctx.Done(), "Close cancellation")
++			mobileAssertZTPending(t, done)
++			stack.unblock()
++			mobileWaitZT(t, done, "Close after detached device stopped")
++		})
++	}
++}
++
++func TestMobileZeroTierConcurrentCloseWaitsForFirst(t *testing.T) {
++	z, stack := mobileZTForClose(t)
++	first := mobileCloseZT(z)
++	mobileWaitZT(t, stack.entered, "first device.Close")
++	second := mobileCloseZT(z)
++	mobileAssertZTPending(t, second)
++	stack.unblock()
++	mobileWaitZT(t, first, "first Close")
++	mobileWaitZT(t, second, "second Close")
++}
++
++type mobileZTReaderStack struct {
++	ipStack
++	readEntered chan struct{}
++	closed      chan struct{}
++	readWoken   chan struct{}
++	finishRead  chan struct{}
++}
++
++func (s *mobileZTReaderStack) MTU() (int, error) { return 1280, nil }
++func (s *mobileZTReaderStack) BatchSize() int    { return 1 }
++func (s *mobileZTReaderStack) Close() error      { close(s.closed); return nil }
++func (s *mobileZTReaderStack) Read(_ [][]byte, _ []int, _ int) (int, error) {
++	close(s.readEntered)
++	<-s.closed
++	close(s.readWoken)
++	<-s.finishRead
++	return 0, errors.New("fixture read closed")
++}
++
++func TestMobileZeroTierWaitsForCancelledStackReader(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	stack := &mobileZTReaderStack{readEntered: make(chan struct{}), closed: make(chan struct{}), readWoken: make(chan struct{}), finishRead: make(chan struct{})}
++	var release sync.Once
++	t.Cleanup(func() { release.Do(func() { close(stack.finishRead) }) })
++	z := &ZeroTier{ctx: ctx, cancel: cancel, tunDevice: stack, stateCh: make(chan struct{})}
++	exited := make(chan struct{})
++	z.mobileWorkers.Add(1)
++	go func() { defer z.mobileWorkers.Done(); defer close(exited); z.runStackPackets(nil, stack) }()
++	mobileWaitZT(t, stack.readEntered, "stack reader")
++	done := mobileCloseZT(z)
++	mobileWaitZT(t, stack.readWoken, "device Close waking Read")
++	mobileAssertZTPending(t, done)
++	release.Do(func() { close(stack.finishRead) })
++	mobileWaitZT(t, done, "Close after reader exit")
++	select {
++	case <-exited:
++	default:
++		t.Error("Close completed before reader returned")
++	}
++}
++
++func TestMobileZeroTierConfigAndFrameWorkersExitOnClose(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	z := &ZeroTier{ctx: ctx, cancel: cancel, stateCh: make(chan struct{}), configCh: make(chan struct{}, 1), frameCh: make(chan zeroTierInboundFrame, 1), haveLatestConfig: true}
++	z.configCh <- struct{}{}
++	z.frameCh <- zeroTierInboundFrame{}
++	configDone := make(chan struct{})
++	frameDone := make(chan struct{})
++	z.operationMu.Lock()
++	z.mobileWorkers.Add(2)
++	go func() { defer z.mobileWorkers.Done(); defer close(configDone); z.runNetworkConfig() }()
++	go func() { defer z.mobileWorkers.Done(); defer close(frameDone); z.runInboundFrames() }()
++	done := mobileCloseZT(z)
++	mobileWaitZT(t, ctx.Done(), "Close cancellation")
++	z.operationMu.Unlock()
++	mobileWaitZT(t, done, "Close with queued configuration and frames")
++	select {
++	case <-configDone:
++	default:
++		t.Error("configuration worker remained after Close")
++	}
++	select {
++	case <-frameDone:
++	default:
++		t.Error("frame worker remained after Close")
++	}
++	if z.tunDevice != nil || z.runtime != nil {
++		t.Error("late configuration restored a closed runtime")
++	}
++}

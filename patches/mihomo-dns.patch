@@ -1,0 +1,461 @@
+--- /dev/null
++++ b/config/mobile_dns.go
+@@ -0,0 +1,28 @@
++package config
++
++import (
++	P "github.com/metacubex/mihomo/constant/provider"
++	"github.com/metacubex/mihomo/dns"
++	RP "github.com/metacubex/mihomo/rules/provider"
++)
++
++func ParseMobileDNS(raw *RawConfig, providers map[string]P.RuleProvider, geo MobileGeo) (*DNS, error) {
++	parsed, err := parseDNS(raw, providers, geo)
++	if err != nil {
++		return nil, err
++	}
++	for _, policies := range [][]dns.Policy{parsed.NameServerPolicy, parsed.ProxyServerPolicy} {
++		for _, policy := range policies {
++			RP.BindMobileRuleSet(policy.Matcher, providers)
++		}
++	}
++	if parsed.FakeIPSkipper != nil {
++		for _, rule := range parsed.FakeIPSkipper.Rules {
++			RP.BindMobileRuleSet(rule, providers)
++		}
++		for _, matcher := range parsed.FakeIPSkipper.Host {
++			RP.BindMobileRuleSet(matcher, providers)
++		}
++	}
++	return parsed, nil
++}
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -48,7 +48,7 @@
+ 		err error
+ 	}
+ 	ch := make(chan result, 1)
+-	go func() {
++	if !scopedGo(ctx, func() {
+ 		dClient := &D.Client{
+ 			UDPSize: 4096,
+ 			Timeout: 5 * time.Second,
+@@ -71,12 +71,15 @@
+ 				return
+ 			}
+ 			defer tcpConn.Close()
++			defer closeOnCancel(ctx, tcpConn)()
+ 			dConn.Conn = tcpConn
+ 			msg, _, err = dClient.ExchangeWithConn(m, dConn)
+ 		}
+ 
+ 		ch <- result{msg, err}
+-	}()
++	}) {
++		return nil, context.Canceled
++	}
+ 
+ 	select {
+ 	case <-ctx.Done():
+--- a/dns/doh.go
++++ b/dns/doh.go
+@@ -36,9 +36,9 @@
+ 	// connections in HTTP transport.
+ 	transportDefaultIdleConnTimeout = 5 * time.Minute
+ 
+-	dialTimeout        = 10 * time.Second
+-
+-	maxElapsedTime  = time.Second * 30
++	dialTimeout = 10 * time.Second
++
++	maxElapsedTime = time.Second * 30
+ )
+ 
+ var DefaultHTTPVersions = []C.HTTPVersion{C.HTTPVersion11, C.HTTPVersion2}
+@@ -614,8 +614,12 @@
+ 	// Run probeQUIC and probeTLS in parallel and see which one is faster.
+ 	chQuic := make(chan error, 1)
+ 	chTLS := make(chan error, 1)
+-	go doh.probeQUIC(ctx, addr, probeTLSCfg, chQuic)
+-	go doh.probeTLS(ctx, probeTLSCfg, chTLS)
++	if !scopedGo(ctx, func() { doh.probeQUIC(ctx, addr, probeTLSCfg, chQuic) }) {
++		return "", context.Canceled
++	}
++	if !scopedGo(ctx, func() { doh.probeTLS(ctx, probeTLSCfg, chTLS) }) {
++		return "", context.Canceled
++	}
+ 
+ 	select {
+ 	case quicErr := <-chQuic:
+--- a/dns/dot.go
++++ b/dns/dot.go
+@@ -47,7 +47,7 @@
+ 	}
+ 	ch := make(chan result, 1)
+ 
+-	go func() {
++	if !scopedGo(ctx, func() {
+ 		var msg *D.Msg
+ 		var err error
+ 		defer func() { ch <- result{msg, err} }()
+@@ -76,6 +76,7 @@
+ 				isOldConn = false
+ 			}
+ 
++			stopClose := closeOnCancel(ctx, conn)
+ 			dClient := &D.Client{
+ 				UDPSize: 4096,
+ 				Timeout: 5 * time.Second,
+@@ -86,6 +87,7 @@
+ 			}
+ 
+ 			msg, _, err = dClient.ExchangeWithConn(m, dConn)
++			stopClose()
+ 			if err != nil {
+ 				_ = conn.Close()
+ 				conn = nil
+@@ -99,7 +101,7 @@
+ 				t.access.Lock()
+ 				if t.connections.Len() >= maxOldDotConns {
+ 					oldConn := t.connections.PopFront()
+-					go oldConn.Close() // close in a new goroutine, not blocking the current task
++					_ = oldConn.Close()
+ 				}
+ 				t.connections.PushBack(conn)
+ 				t.access.Unlock()
+@@ -108,7 +110,9 @@
+ 			}
+ 			return
+ 		}
+-	}()
++	}) {
++		return nil, context.Canceled
++	}
+ 
+ 	select {
+ 	case <-ctx.Done():
+@@ -150,7 +154,7 @@
+ 		t.access.Lock()
+ 		for t.connections.Len() > 0 {
+ 			oldConn := t.connections.PopFront()
+-			go oldConn.Close() // close in a new goroutine, not blocking the current task
++			_ = oldConn.Close()
+ 		}
+ 		t.access.Unlock()
+ 	}
+--- a/dns/resolver.go
++++ b/dns/resolver.go
+@@ -37,6 +37,7 @@
+ }
+ 
+ type Resolver struct {
++	scope                 *SessionScope
+ 	ipv6                  bool
+ 	ipv6Timeout           time.Duration
+ 	main                  []dnsClient
+@@ -52,14 +53,16 @@
+ 
+ func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
+ 	ch := make(chan []netip.Addr, 1)
+-	go func() {
++	if !r.task(func() {
+ 		defer close(ch)
+ 		ip, err := r.lookupIP(ctx, host, D.TypeAAAA)
+ 		if err != nil {
+ 			return
+ 		}
+ 		ch <- ip
+-	}()
++	}) {
++		close(ch)
++	}
+ 
+ 	ips, err = r.lookupIP(ctx, host, D.TypeA)
+ 	if err == nil {
+@@ -76,7 +79,7 @@
+ 
+ func (r *Resolver) LookupIP(ctx context.Context, host string) (ips []netip.Addr, err error) {
+ 	ch := make(chan []netip.Addr, 1)
+-	go func() {
++	if !r.task(func() {
+ 		defer close(ch)
+ 		ip, err := r.lookupIP(ctx, host, D.TypeAAAA)
+ 		if err != nil {
+@@ -84,7 +87,9 @@
+ 		}
+ 
+ 		ch <- ip
+-	}()
++	}) {
++		close(ch)
++	}
+ 
+ 	ips, err = r.lookupIP(ctx, host, D.TypeA)
+ 	var waitIPv6 *time.Timer
+@@ -150,17 +155,22 @@
+ 
+ // ExchangeContext a batch of dns request with context.Context, and it use cache
+ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
++	ctx, done, ok := r.attach(ctx)
++	if !ok {
++		return nil, context.Canceled
++	}
++	defer done()
+ 	if len(m.Question) == 0 {
+ 		return nil, errors.New("should have one question at least")
+ 	}
+ 	continueFetch := false
+ 	defer func() {
+ 		if continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+-			go func() {
+-				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
++			r.task(func() {
++				ctx, cancel := context.WithTimeout(r.backgroundContext(), resolver.DefaultDNSTimeout)
+ 				defer cancel()
+ 				_, _ = r.exchangeWithoutCache(ctx, m) // ignore result, just for putMsgToCache
+-			}()
++			})
+ 		}
+ 	}()
+ 
+@@ -191,7 +201,12 @@
+ 	retryMax := 3
+ 	initiator := queryInitiator(ctx)
+ 	fn := func() (result *D.Msg, err error) {
+-		ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout) // reset timeout in singleflight
++		done, ok := r.scope.begin()
++		if !ok {
++			return &D.Msg{}, context.Canceled
++		}
++		defer done()
++		ctx, cancel := context.WithTimeout(r.backgroundContext(), resolver.DefaultDNSTimeout) // reset timeout in singleflight
+ 		defer cancel()
+ 		ctx, trace := r.traceExchange(ctx, q, initiator)
+ 		cache := false
+@@ -236,13 +251,13 @@
+ 		case result = <-ch: // maybe ctxDone and chFinish in same time, get DoChan's result as much as possible
+ 			break
+ 		default:
+-			go func() { // start a retrying monitor in background
++			r.task(func() { // start a retrying monitor in background
+ 				result := <-ch
+ 				ret, err, shared := result.Val, result.Err, result.Shared
+ 				if err != nil && !shared && ret.Opcode < retryMax { // retry
+ 					r.group.DoChan(q.String(), fn)
+ 				}
+-			}()
++			})
+ 			return nil, ctx.Err()
+ 		}
+ 	}
+@@ -379,10 +394,12 @@
+ 
+ func (r *Resolver) asyncExchange(ctx context.Context, client []dnsClient, msg *D.Msg) <-chan *result {
+ 	ch := make(chan *result, 1)
+-	go func() {
++	if !r.task(func() {
+ 		res, _, err := batchExchange(ctx, client, msg)
+ 		ch <- &result{Msg: res, Error: err}
+-	}()
++	}) {
++		ch <- &result{Error: context.Canceled}
++	}
+ 	return ch
+ }
+ 
+@@ -473,6 +490,7 @@
+ }
+ 
+ type Config struct {
++	Context              context.Context
+ 	Main, Fallback       []NameServer
+ 	Default              []NameServer
+ 	ProxyServer          []NameServer
+@@ -507,6 +525,13 @@
+ 	DirectResolver *Resolver
+ }
+ 
++func (rs Resolvers) Close() {
++	if rs.Resolver != nil && rs.Resolver.scope != nil {
++		rs.Resolver.scope.Close()
++	}
++	rs.ResetConnection()
++}
++
+ func (rs Resolvers) ClearCache() {
+ 	rs.Resolver.ClearCache()
+ 	rs.ProxyResolver.ClearCache()
+@@ -521,6 +546,7 @@
+ 
+ func NewResolverFromClient(client dnsClient) *Resolver {
+ 	return &Resolver{
++		scope: resolverScope(nil),
+ 		ipv6:  true,
+ 		main:  []dnsClient{client},
+ 		cache: Config{}.newCache(),
+@@ -528,7 +554,9 @@
+ }
+ 
+ func NewResolver(config Config) (rs Resolvers) {
++	scope := resolverScope(config.Context)
+ 	defaultResolver := &Resolver{
++		scope:       scope,
+ 		main:        transform(config.Default, nil),
+ 		cache:       config.newCache(),
+ 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+@@ -599,6 +627,7 @@
+ 	}
+ 
+ 	r := &Resolver{
++		scope:       scope,
+ 		ipv6:        config.IPv6,
+ 		main:        cacheTransform(config.Main),
+ 		cache:       config.newCache(),
+@@ -610,6 +639,7 @@
+ 
+ 	if len(config.ProxyServer) != 0 {
+ 		rs.ProxyResolver = &Resolver{
++			scope:       scope,
+ 			ipv6:        config.IPv6,
+ 			main:        cacheTransform(config.ProxyServer),
+ 			cache:       config.newCache(),
+@@ -620,6 +650,7 @@
+ 
+ 	if len(config.DirectServer) != 0 {
+ 		rs.DirectResolver = &Resolver{
++			scope:       scope,
+ 			ipv6:        config.IPv6,
+ 			main:        cacheTransform(config.DirectServer),
+ 			cache:       config.newCache(),
+--- /dev/null
++++ b/dns/session_scope.go
+@@ -0,0 +1,103 @@
++package dns
++
++import (
++	"context"
++	"sync"
++)
++
++type sessionScopeKey struct{}
++
++type SessionScope struct {
++	ctx    context.Context
++	cancel context.CancelFunc
++	mu     sync.Mutex
++	closed bool
++	tasks  sync.WaitGroup
++}
++
++var ContextProvider func() context.Context
++
++func NewSessionScope(parent context.Context) *SessionScope {
++	ctx, cancel := context.WithCancel(parent)
++	scope := &SessionScope{cancel: cancel}
++	scope.ctx = context.WithValue(ctx, sessionScopeKey{}, scope)
++	return scope
++}
++func (s *SessionScope) Context() context.Context { return s.ctx }
++func (s *SessionScope) begin() (func(), bool) {
++	if s == nil {
++		return func() {}, true
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed || s.ctx.Err() != nil {
++		return func() {}, false
++	}
++	s.tasks.Add(1)
++	return s.tasks.Done, true
++}
++func (s *SessionScope) Close() {
++	s.mu.Lock()
++	s.closed = true
++	s.cancel()
++	s.mu.Unlock()
++	s.tasks.Wait()
++}
++func (s *SessionScope) Go(fn func()) bool {
++	done, ok := s.begin()
++	if !ok {
++		return false
++	}
++	go func() { defer done(); fn() }()
++	return true
++}
++func scopeFrom(ctx context.Context) *SessionScope {
++	if ctx == nil {
++		return nil
++	}
++	scope, _ := ctx.Value(sessionScopeKey{}).(*SessionScope)
++	return scope
++}
++func scopedGo(ctx context.Context, fn func()) bool { return scopeFrom(ctx).Go(fn) }
++func resolverScope(ctx context.Context) *SessionScope {
++	if ctx == nil && ContextProvider != nil {
++		ctx = ContextProvider()
++	}
++	if ctx == nil {
++		return nil
++	}
++	if scope := scopeFrom(ctx); scope != nil {
++		return scope
++	}
++	return NewSessionScope(ctx)
++}
++func (r *Resolver) backgroundContext() context.Context {
++	if r.scope != nil {
++		return r.scope.ctx
++	}
++	return context.Background()
++}
++func (r *Resolver) task(fn func()) bool { return r.scope.Go(fn) }
++func (r *Resolver) attach(ctx context.Context) (context.Context, func(), bool) {
++	done, ok := r.scope.begin()
++	if !ok {
++		return ctx, done, false
++	}
++	if r.scope == nil {
++		return ctx, done, true
++	}
++	ctx, cancel := context.WithCancel(ctx)
++	stop := context.AfterFunc(r.scope.ctx, cancel)
++	ctx = context.WithValue(ctx, sessionScopeKey{}, r.scope)
++	return ctx, func() { stop(); cancel(); done() }, true
++}
++
++func closeOnCancel(ctx context.Context, conn interface{ Close() error }) func() {
++	done := make(chan struct{})
++	stop := context.AfterFunc(ctx, func() { _ = conn.Close(); close(done) })
++	return func() {
++		if !stop() {
++			<-done
++		}
++	}
++}
+--- a/dns/util.go
++++ b/dns/util.go
+@@ -414,16 +414,18 @@
+ 
+ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.Msg, cache bool, err error) {
+ 	cache = true
++	for _, client := range clients {
++		if _, isRCodeClient := client.(rcodeClient); isRCodeClient {
++			msg, err = client.ExchangeContext(ctx, m)
++			traceAnswer(ctx, msg, client.Address())
++			return msg, false, err
++		}
++	}
+ 	fast, ctx := picker.WithTimeout[*D.Msg](ctx, resolver.DefaultDNSTimeout)
+ 	defer fast.Close()
+ 	domain := msgToDomain(m)
+ 	_, qTypeStr := msgToQtype(m)
+ 	for _, client := range clients {
+-		if _, isRCodeClient := client.(rcodeClient); isRCodeClient {
+-			msg, err = client.ExchangeContext(ctx, m)
+-			traceAnswer(ctx, msg, client.Address())
+-			return msg, false, err
+-		}
+ 		client := client // shadow define client to ensure the value captured by the closure will not be changed in the next loop
+ 		fast.Go(func() (*D.Msg, error) {
+ 			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())

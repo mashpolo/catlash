@@ -1,0 +1,196 @@
+--- /dev/null
++++ b/rules/provider/mobile_mrs.go
+@@ -0,0 +1,193 @@
++package provider
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"net/netip"
++
++	"github.com/klauspost/compress/zstd"
++	P "github.com/metacubex/mihomo/constant/provider"
++)
++
++const (
++	mobileMRSMaxBytes  = 16 << 20
++	mobileMRSMaxRules  = 500_000
++	mobileMRSMaxNodes  = 1_000_000
++	mobileMRSMaxRanges = 100_000
++)
++
++var errMobileMRS = errors.New("invalid or oversized mobile MRS resource")
++
++type mobileMRSProvider struct {
++	baseProvider
++	name string
++}
++
++func (p *mobileMRSProvider) Name() string               { return p.name }
++func (p *mobileMRSProvider) VehicleType() P.VehicleType { return P.Inline }
++func (p *mobileMRSProvider) Initial() error             { return nil }
++func (p *mobileMRSProvider) Update() error              { return nil }
++
++func NewMobileMRSProvider(name string, behavior P.RuleBehavior, data []byte) (P.RuleProvider, error) {
++	if name == "" || (behavior != P.Domain && behavior != P.IPCIDR) || len(data) > mobileMRSMaxBytes {
++		return nil, errMobileMRS
++	}
++	decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true),
++		zstd.WithDecoderMaxMemory(mobileMRSMaxBytes), zstd.WithDecoderMaxWindow(8<<20))
++	if err != nil {
++		return nil, errMobileMRS
++	}
++	defer decoder.Close()
++	decoded, err := decoder.DecodeAll(data, nil)
++	if err != nil || len(decoded) > mobileMRSMaxBytes {
++		return nil, errMobileMRS
++	}
++	cursor := mobileMRSCursor{data: decoded}
++	header, err := cursor.take(5)
++	if err != nil || !bytes.Equal(header[:4], MrsMagicBytes[:]) || header[4] != behavior.Byte() {
++		return nil, errMobileMRS
++	}
++	count, err := cursor.length(mobileMRSMaxRules, false)
++	if err != nil {
++		return nil, err
++	}
++	extra, err := cursor.length(64<<10, true)
++	if err != nil {
++		return nil, err
++	}
++	if _, err = cursor.take(extra); err != nil {
++		return nil, err
++	}
++	body := decoded[cursor.offset:]
++	if behavior == P.Domain {
++		err = validateMobileMRSDomain(body)
++	} else {
++		err = validateMobileMRSIPCIDR(body)
++	}
++	if err != nil {
++		return nil, err
++	}
++	strategy := newStrategy(behavior, nil)
++	strategy.Reset()
++	if err = strategy.(mrsRuleStrategy).FromMrs(bytes.NewReader(body), count); err != nil {
++		return nil, errMobileMRS
++	}
++	return &mobileMRSProvider{baseProvider: baseProvider{behavior: behavior, strategy: strategy}, name: name}, nil
++}
++
++type mobileMRSCursor struct {
++	data   []byte
++	offset int
++}
++
++func (c *mobileMRSCursor) take(size int) ([]byte, error) {
++	if size < 0 || size > len(c.data)-c.offset {
++		return nil, errMobileMRS
++	}
++	result := c.data[c.offset : c.offset+size]
++	c.offset += size
++	return result, nil
++}
++
++func (c *mobileMRSCursor) length(maximum int, allowZero bool) (int, error) {
++	data, err := c.take(8)
++	if err != nil {
++		return 0, err
++	}
++	value := binary.BigEndian.Uint64(data)
++	if value > uint64(maximum) || (value == 0 && !allowZero) {
++		return 0, errMobileMRS
++	}
++	return int(value), nil
++}
++
++func (c *mobileMRSCursor) vector(stride, maximum int) ([]byte, error) {
++	length, err := c.length(maximum, false)
++	if err != nil {
++		return nil, err
++	}
++	return c.take(length * stride)
++}
++
++func validateMobileMRSDomain(data []byte) error {
++	cursor := mobileMRSCursor{data: data}
++	version, err := cursor.take(1)
++	if err != nil || version[0] != 1 {
++		return errMobileMRS
++	}
++	leaves, err := cursor.vector(8, (mobileMRSMaxNodes+63)/64)
++	if err != nil {
++		return err
++	}
++	bitmap, err := cursor.vector(8, (2*mobileMRSMaxNodes+63)/64)
++	if err != nil {
++		return err
++	}
++	labels, err := cursor.vector(1, mobileMRSMaxNodes-1)
++	if err != nil || cursor.offset != len(data) {
++		return errMobileMRS
++	}
++	nodes := len(labels) + 1
++	bits := 2*nodes - 1
++	if len(leaves) != (nodes+63)/64*8 || len(bitmap) != (bits+63)/64*8 {
++		return errMobileMRS
++	}
++	pending, node, children := 1, 0, 0
++	for bit := 0; bit < bits; bit++ {
++		if mobileMRSBit(bitmap, bit) == 0 {
++			pending++
++			children++
++			continue
++		}
++		if node >= nodes || (children == 0 && mobileMRSBit(leaves, node) == 0) {
++			return errMobileMRS
++		}
++		node++
++		children = 0
++		pending--
++		if pending == 0 && bit != bits-1 {
++			return errMobileMRS
++		}
++	}
++	if pending != 0 || node != nodes {
++		return errMobileMRS
++	}
++	for bit := bits; bit < len(bitmap)*8; bit++ {
++		if mobileMRSBit(bitmap, bit) != 0 {
++			return errMobileMRS
++		}
++	}
++	for bit := nodes; bit < len(leaves)*8; bit++ {
++		if mobileMRSBit(leaves, bit) != 0 {
++			return errMobileMRS
++		}
++	}
++	return nil
++}
++
++func mobileMRSBit(data []byte, index int) uint64 {
++	return (binary.BigEndian.Uint64(data[index/64*8:]) >> (index % 64)) & 1
++}
++
++func validateMobileMRSIPCIDR(data []byte) error {
++	cursor := mobileMRSCursor{data: data}
++	version, err := cursor.take(1)
++	if err != nil || version[0] != 1 {
++		return errMobileMRS
++	}
++	ranges, err := cursor.vector(32, mobileMRSMaxRanges)
++	if err != nil || cursor.offset != len(data) {
++		return errMobileMRS
++	}
++	var previous netip.Addr
++	for offset := 0; offset < len(ranges); offset += 32 {
++		from := netip.AddrFrom16([16]byte(ranges[offset : offset+16])).Unmap()
++		to := netip.AddrFrom16([16]byte(ranges[offset+16 : offset+32])).Unmap()
++		if from.Is4() != to.Is4() || from.Compare(to) > 0 || (previous.IsValid() && previous.Compare(from) >= 0) {
++			return errMobileMRS
++		}
++		previous = to
++	}
++	return nil
++}
